@@ -1008,13 +1008,13 @@ def process_single_collage(args_tuple):
     Args:
         args_tuple: Tuple of (batch_idx, batch, output_path, canvas_width, canvas_height,
                              respect_original_size, max_size_variation, overlap_percent,
-                             no_uniformity, randomize, bg_color)
+                             no_uniformity, randomize, bg_color, save_to_file)
 
     Returns:
-        Dictionary with results and statistics
+        Dictionary with results, statistics, and optionally the canvas
     """
     (batch_idx, batch, output_path, canvas_width, canvas_height,
-     respect_original_size, max_size_variation, overlap_percent, no_uniformity, randomize, bg_color) = args_tuple
+     respect_original_size, max_size_variation, overlap_percent, no_uniformity, randomize, bg_color, save_to_file) = args_tuple
 
     # Create a new packer instance for this batch
     packer = ImagePacker(
@@ -1033,9 +1033,10 @@ def process_single_collage(args_tuple):
     # Create collage
     collage = packer.create_collage(background_color=bg_color)
 
-    # Save
-    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    collage.save(output_path, quality=95)
+    # Save or keep in memory
+    if save_to_file:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        collage.save(output_path, quality=95)
 
     # Calculate statistics
     total_image_area = sum(p.width * p.height for p in packed)
@@ -1089,6 +1090,10 @@ def process_single_collage(args_tuple):
                     max_overlap_percent = max(max_overlap_percent, overlap_percent)
         stats['max_overlap'] = max_overlap_percent
 
+    # Include canvas if not saving to file (for PDF generation)
+    if not save_to_file:
+        stats['canvas'] = collage
+
     return stats
 
 
@@ -1111,6 +1116,44 @@ def print_collage_stats(stats, total_batches):
         print(f"Area uniformity - Max deviation from average: {stats['max_area_deviation']:.2f}%")
         print(f"Aspect ratio preservation - Max deviation: {stats['max_aspect_error']:.2f}%")
         print(f"Image overlap - Max overlap: {stats['max_overlap']:.2f}% of any image's area")
+
+
+def save_canvases_to_pdf(canvases: List, output_path: str):
+    """
+    Save multiple canvases (PIL Images) to a single PDF file.
+
+    Args:
+        canvases: List of PIL Image objects (one per page)
+        output_path: Path to save the PDF file
+    """
+    if not canvases:
+        print("Error: No canvases to save to PDF")
+        return
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+
+    # Convert all images to RGB mode (PDF requires RGB)
+    rgb_canvases = []
+    for canvas in canvases:
+        if canvas.mode != 'RGB':
+            rgb_canvases.append(canvas.convert('RGB'))
+        else:
+            rgb_canvases.append(canvas)
+
+    # Save first image with remaining images as additional pages
+    if len(rgb_canvases) == 1:
+        rgb_canvases[0].save(output_path, 'PDF', quality=95)
+    else:
+        rgb_canvases[0].save(
+            output_path,
+            'PDF',
+            save_all=True,
+            append_images=rgb_canvases[1:],
+            quality=95
+        )
+
+    print(f"\nPDF saved with {len(canvases)} page(s) to {output_path}")
 
 
 def main():
@@ -1139,6 +1182,11 @@ def main():
         '-o', '--output',
         default='output_images/collage.png',
         help='Output file path (default: output_images/collage.png)'
+    )
+    parser.add_argument(
+        '--pdf',
+        action='store_true',
+        help='Save all collages as a single PDF file (one collage per page)'
     )
     parser.add_argument(
         '--respect-original-size',
@@ -1344,7 +1392,8 @@ def main():
                 args.overlap_percent,
                 args.no_uniformity,
                 args.randomize,
-                bg_color
+                bg_color,
+                not args.pdf  # save_to_file: False when creating PDF
             ))
 
         # Process in parallel with progress bar
@@ -1361,6 +1410,13 @@ def main():
         for stats in results:
             print_collage_stats(stats, len(image_batches))
 
+        # If PDF mode, save all canvases to a single PDF
+        if args.pdf:
+            canvases = [result['canvas'] for result in results]
+            # Change output extension to .pdf
+            pdf_output = os.path.splitext(args.output)[0] + '.pdf'
+            save_canvases_to_pdf(canvases, pdf_output)
+
     else:
         # Sequential processing (single collage or single job)
         if len(image_batches) == 1:
@@ -1368,6 +1424,7 @@ def main():
         else:
             print(f"\nCreating {len(image_batches)} collages sequentially...")
 
+        canvases = []  # For PDF mode
         for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
             print(f"\n{'='*60}")
             print(f"Collage {batch_idx}/{len(image_batches)}: {len(batch)} images -> {output_path}")
@@ -1385,10 +1442,13 @@ def main():
             print("Creating collage...")
             collage = packer.create_collage(background_color=bg_color)
 
-            # Save
-            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-            collage.save(output_path, quality=95)
-            print(f"Collage saved to {output_path}")
+            # Save or collect for PDF
+            if args.pdf:
+                canvases.append(collage)
+            else:
+                os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+                collage.save(output_path, quality=95)
+                print(f"Collage saved to {output_path}")
 
             # Print statistics
             total_image_area = sum(p.width * p.height for p in packed)
@@ -1429,6 +1489,11 @@ def main():
                             overlap_percent = (overlap_area / p_area) * 100
                             max_overlap_percent = max(max_overlap_percent, overlap_percent)
                 print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
+
+        # If PDF mode in sequential processing, save all canvases to a single PDF
+        if args.pdf and canvases:
+            pdf_output = os.path.splitext(args.output)[0] + '.pdf'
+            save_canvases_to_pdf(canvases, pdf_output)
 
     print(f"\n{'='*60}")
     print(f"✓ Created {len(image_batches)} collage(s) successfully")
