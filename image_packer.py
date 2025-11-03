@@ -469,7 +469,12 @@ class ImagePacker:
             return
 
         n = len(self.packed_images)
-        max_iterations = 50  # Hard limit on iterations to prevent infinite loops
+        max_iterations = 10  # Reduced from 50 for performance
+
+        # For large numbers of images, optimization can be slow
+        if n > 10:
+            tqdm.write(f"Enforcing area uniformity for {n} images (this may take a moment)...")
+            tqdm.write(f"Tip: Use --no-uniformity to skip this step for faster processing")
 
         # Store original sizes for reference
         original_widths = np.array([p.width for p in self.packed_images])
@@ -498,6 +503,11 @@ class ImagePacker:
                 if areas_in_range:
                     # Success! All images meet the area constraint
                     pbar.set_description(f"✓ Area uniformity achieved")
+                    break
+
+                # Early termination: if deviation is acceptable (within 2x the target), good enough
+                if max_deviation <= max_area_variation * 200:  # 2x tolerance
+                    pbar.set_description(f"✓ Area uniformity acceptable")
                     break
 
                 # Update reference sizes for this iteration
@@ -589,14 +599,14 @@ class ImagePacker:
                 # Bounds: scales must be positive, allow wider range for adjustment
                 bounds = [(0.1, 3.0) for _ in range(n)]
 
-                # Solve optimization problem with tighter tolerance
+                # Solve optimization problem - reduced iterations for speed
                 result = minimize(
                     objective,
                     x0,
                     method='SLSQP',
                     bounds=bounds,
                     constraints=constraints,
-                    options={'maxiter': 2000, 'ftol': 1e-9}
+                    options={'maxiter': 100, 'ftol': 1e-4}  # Much faster: 100 iter, looser tolerance
                 )
 
                 # Apply optimized scales
@@ -644,9 +654,11 @@ class ImagePacker:
         final_max_area = final_avg_area * (1 + max_area_variation)
 
         if not np.all((final_areas >= final_min_area) & (final_areas <= final_max_area)):
-            print(f"Warning: Could not achieve perfect area uniformity within {max_iterations} iterations")
             max_deviation = np.max(np.abs(final_areas - final_avg_area) / final_avg_area)
-            print(f"Maximum area deviation from average: {max_deviation * 100:.2f}%")
+            # Only warn if deviation is significantly over target
+            if max_deviation > max_area_variation * 1.5:
+                tqdm.write(f"Note: Area deviation {max_deviation * 100:.1f}% exceeds target {max_area_variation * 100:.0f}%")
+                tqdm.write(f"Tip: Use --no-uniformity for faster processing with higher coverage")
 
     def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
         """
