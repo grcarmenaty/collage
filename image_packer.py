@@ -240,6 +240,108 @@ class ImagePacker:
 
         return True
 
+    def grow_images_to_fill_space(self):
+        """
+        After initial packing, try to grow images to fill remaining whitespace.
+        Allows slight size variations to maximize space utilization.
+        """
+        if not self.packed_images:
+            return
+
+        # Try to grow each image
+        for i, packed in enumerate(self.packed_images):
+            # Calculate how much we can grow in width and height
+            max_width_growth = 0
+            max_height_growth = 0
+
+            # Check constraints from canvas boundaries
+            max_width_at_pos = self.canvas_width - packed.x
+            max_height_at_pos = self.canvas_height - packed.y
+
+            # Check constraints from other images
+            for j, other in enumerate(self.packed_images):
+                if i == j:
+                    continue
+
+                # Check if other image is to the right
+                if (other.x >= packed.x + packed.width and
+                    other.y < packed.y + packed.height and
+                    other.y + other.height > packed.y):
+                    potential_width = other.x - packed.x
+                    max_width_at_pos = min(max_width_at_pos, potential_width)
+
+                # Check if other image is below
+                if (other.y >= packed.y + packed.height and
+                    other.x < packed.x + packed.width and
+                    other.x + other.width > packed.x):
+                    potential_height = other.y - packed.y
+                    max_height_at_pos = min(max_height_at_pos, potential_height)
+
+            max_width_growth = max_width_at_pos - packed.width
+            max_height_growth = max_height_at_pos - packed.height
+
+            # Maintain aspect ratio while growing
+            aspect_ratio = packed.info.aspect_ratio
+
+            # Try different growth strategies
+            # Strategy 1: Grow width as much as possible while maintaining aspect ratio
+            if max_width_growth > 0:
+                new_width = packed.width + max_width_growth
+                new_height = int(new_width / aspect_ratio)
+                if new_height <= packed.height + max_height_growth:
+                    # Check if this doesn't overlap with other images
+                    if self._check_space_available(packed.x, packed.y, new_width, new_height, i):
+                        packed.width = new_width
+                        packed.height = new_height
+                        continue
+
+            # Strategy 2: Grow height as much as possible while maintaining aspect ratio
+            if max_height_growth > 0:
+                new_height = packed.height + max_height_growth
+                new_width = int(new_height * aspect_ratio)
+                if new_width <= packed.width + max_width_growth:
+                    # Check if this doesn't overlap with other images
+                    if self._check_space_available(packed.x, packed.y, new_width, new_height, i):
+                        packed.width = new_width
+                        packed.height = new_height
+                        continue
+
+            # Strategy 3: Grow proportionally to fill available space
+            if max_width_growth > 0 and max_height_growth > 0:
+                # Calculate scale factors for each dimension
+                width_scale = (packed.width + max_width_growth) / packed.width
+                height_scale = (packed.height + max_height_growth) / packed.height
+
+                # Use the smaller scale to maintain aspect ratio
+                growth_scale = min(width_scale, height_scale)
+
+                new_width = int(packed.width * growth_scale)
+                new_height = int(packed.height * growth_scale)
+
+                if self._check_space_available(packed.x, packed.y, new_width, new_height, i):
+                    packed.width = new_width
+                    packed.height = new_height
+
+    def _check_space_available(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
+        """Check if a rectangle at (x, y) with given dimensions overlaps with any packed images."""
+        # Check canvas boundaries
+        if x + width > self.canvas_width or y + height > self.canvas_height:
+            return False
+
+        # Check overlap with other images
+        for i, other in enumerate(self.packed_images):
+            if i == exclude_index:
+                continue
+
+            # Check for overlap
+            if not (x + width <= other.x or
+                    x >= other.x + other.width or
+                    y + height <= other.y or
+                    y >= other.y + other.height):
+                return False
+
+        return True
+
     def pack(self, images: List[ImageInfo]) -> List[PackedImage]:
         """Pack all images into the canvas, finding the optimal scale."""
         if not images:
@@ -263,6 +365,11 @@ class ImagePacker:
 
         # Pack with the best scale found
         self.try_pack_with_scale(images, best_scale)
+
+        # Grow images to fill remaining whitespace (allows slight size variations)
+        # This prioritizes space utilization over perfect size equality
+        if not self.respect_original_size:
+            self.grow_images_to_fill_space()
 
         return self.packed_images
 
@@ -293,7 +400,9 @@ def main():
     )
     parser.add_argument(
         'folder',
-        help='Path to folder containing images'
+        nargs='?',
+        default='input_images',
+        help='Path to folder containing images (default: input_images)'
     )
     parser.add_argument(
         '-W', '--width',
@@ -309,8 +418,8 @@ def main():
     )
     parser.add_argument(
         '-o', '--output',
-        default='collage.png',
-        help='Output file path (default: collage.png)'
+        default='output_images/collage.png',
+        help='Output file path (default: output_images/collage.png)'
     )
     parser.add_argument(
         '--respect-original-size',
