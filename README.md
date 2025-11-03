@@ -48,12 +48,15 @@ This will read images from `input_images/` and save to `output_images/collage.pn
 - `--respect-original-size`: Maintain relative size differences between images (default: make all images roughly equal in size, then grow to fill whitespace)
 - `--max-size-variation`: Maximum percentage variation in image area from average (default: 15.0)
 - `--overlap-percent`: Percentage of overlap allowed between images (default: 10.0)
+- `--no-uniformity`: Skip area uniformity enforcement to maximize coverage (images may vary more in size)
 - `--background-color`: Background color as R,G,B (default: 255,255,255 for white)
 
 **Notes:**
 - You cannot specify both `-n` and `-p` at the same time
 - Parallel processing is automatically enabled when creating multiple collages
 - Use `-j 1` to force sequential processing
+- With `--overlap-percent 0`, area uniformity enforcement is automatically skipped for better coverage
+- Use `--no-uniformity` to prioritize maximum coverage over uniform image sizes
 
 ### Examples
 
@@ -129,6 +132,20 @@ Force sequential processing:
 ```bash
 uv run image_packer.py -W 1920 -H 1080 -n 5 -j 1
 # Process collages one at a time (useful for debugging)
+```
+
+Maximize coverage with no overlap (best for filling the canvas):
+```bash
+uv run image_packer.py -W 1920 -H 1080 --overlap-percent 0 -n 8
+# Automatically skips area uniformity enforcement for better coverage
+# Images grow aggressively to fill space (may vary more in size)
+```
+
+Force maximum coverage mode:
+```bash
+uv run image_packer.py -W 1920 -H 1080 --no-uniformity
+# Skip area uniformity enforcement entirely
+# Prioritizes filling canvas over uniform image sizes
 ```
 
 ## Performance

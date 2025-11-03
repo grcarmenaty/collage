@@ -55,12 +55,14 @@ class ImagePacker:
     def __init__(self, canvas_width: int, canvas_height: int,
                  respect_original_size: bool = False,
                  max_size_variation: float = 15.0,
-                 overlap_percent: float = 10.0):
+                 overlap_percent: float = 10.0,
+                 no_uniformity: bool = False):
         self.canvas_width = canvas_width
         self.canvas_height = canvas_height
         self.respect_original_size = respect_original_size
         self.max_size_variation = max_size_variation / 100.0  # Convert to decimal
         self.overlap_percent = overlap_percent / 100.0  # Convert to decimal
+        self.no_uniformity = no_uniformity
         self.free_rectangles: List[Rectangle] = [Rectangle(0, 0, canvas_width, canvas_height)]
         self.packed_images: List[PackedImage] = []
 
@@ -327,11 +329,20 @@ class ImagePacker:
 
         # Maximum allowed area is based on canvas area and number of images
         # With high variation, some images can be much larger
-        max_allowed_area = (canvas_area / len(self.packed_images)) * (1 + self.max_size_variation)
+        # When overlap is very low, be MUCH more aggressive since we won't be able
+        # to enforce uniformity later - prioritize coverage over uniformity
+        if self.overlap_percent < 0.05:
+            # No uniformity enforcement later, so allow images to grow much larger
+            max_allowed_area = (canvas_area / len(self.packed_images)) * 5.0  # Very aggressive
+            num_passes = 10  # More passes to fill space
+        else:
+            # Will enforce uniformity later, so moderate growth
+            max_allowed_area = (canvas_area / len(self.packed_images)) * (1 + self.max_size_variation)
+            num_passes = 5
 
         # Multiple aggressive growth passes - more passes for better filling
-        with tqdm(total=5, desc="Growing images to fill space", unit="pass", leave=False) as pbar:
-            for growth_pass in range(5):
+        with tqdm(total=num_passes, desc="Growing images to fill space", unit="pass", leave=False) as pbar:
+            for growth_pass in range(num_passes):
                 # Track if any changes were made
                 any_changes = False
 
@@ -722,8 +733,18 @@ class ImagePacker:
         # This prioritizes space utilization over perfect size equality
         if not self.respect_original_size:
             self.grow_images_to_fill_space()
-            # Enforce strict area uniformity using the user's max_size_variation parameter
-            self.enforce_area_uniformity(max_area_variation=self.max_size_variation)
+
+            # Only enforce area uniformity if explicitly enabled and we have enough overlap
+            # With 0% or very low overlap, we can't move images around to enforce uniformity
+            # without creating overlaps, which leads to optimizer failures
+            if self.no_uniformity:
+                print("Skipping area uniformity enforcement (--no-uniformity flag)")
+            elif self.overlap_percent < 0.05:  # Less than 5% overlap
+                print(f"Skipping area uniformity enforcement due to low overlap allowance ({self.overlap_percent*100:.0f}%)")
+                print(f"For area uniformity with low overlap, try increasing --overlap-percent to at least 5%")
+            else:
+                # Enforce strict area uniformity using the user's max_size_variation parameter
+                self.enforce_area_uniformity(max_area_variation=self.max_size_variation)
 
         return self.packed_images
 
@@ -754,13 +775,14 @@ def process_single_collage(args_tuple):
 
     Args:
         args_tuple: Tuple of (batch_idx, batch, output_path, canvas_width, canvas_height,
-                             respect_original_size, max_size_variation, overlap_percent, bg_color)
+                             respect_original_size, max_size_variation, overlap_percent,
+                             no_uniformity, bg_color)
 
     Returns:
         Dictionary with results and statistics
     """
     (batch_idx, batch, output_path, canvas_width, canvas_height,
-     respect_original_size, max_size_variation, overlap_percent, bg_color) = args_tuple
+     respect_original_size, max_size_variation, overlap_percent, no_uniformity, bg_color) = args_tuple
 
     # Create a new packer instance for this batch
     packer = ImagePacker(
@@ -768,7 +790,8 @@ def process_single_collage(args_tuple):
         canvas_height,
         respect_original_size=respect_original_size,
         max_size_variation=max_size_variation,
-        overlap_percent=overlap_percent
+        overlap_percent=overlap_percent,
+        no_uniformity=no_uniformity
     )
 
     # Pack images
@@ -907,6 +930,11 @@ def main():
         help='Background color as R,G,B (default: 255,255,255 for white)'
     )
     parser.add_argument(
+        '--no-uniformity',
+        action='store_true',
+        help='Skip area uniformity enforcement to maximize coverage (images may vary more in size)'
+    )
+    parser.add_argument(
         '-n', '--images-per-collage',
         type=int,
         help='Number of images per collage (creates multiple collages if needed)'
@@ -945,7 +973,8 @@ def main():
         args.height,
         respect_original_size=args.respect_original_size,
         max_size_variation=args.max_size_variation,
-        overlap_percent=args.overlap_percent
+        overlap_percent=args.overlap_percent,
+        no_uniformity=args.no_uniformity
     )
 
     # Load images
@@ -1027,6 +1056,7 @@ def main():
                 args.respect_original_size,
                 args.max_size_variation,
                 args.overlap_percent,
+                args.no_uniformity,
                 bg_color
             ))
 
