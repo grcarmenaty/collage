@@ -16,6 +16,8 @@ import math
 import numpy as np
 from scipy.optimize import minimize
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 
 @dataclass
@@ -746,6 +748,115 @@ class ImagePacker:
         return canvas
 
 
+def process_single_collage(args_tuple):
+    """
+    Process a single collage batch. Designed to be called in parallel.
+
+    Args:
+        args_tuple: Tuple of (batch_idx, batch, output_path, canvas_width, canvas_height,
+                             respect_original_size, max_size_variation, overlap_percent, bg_color)
+
+    Returns:
+        Dictionary with results and statistics
+    """
+    (batch_idx, batch, output_path, canvas_width, canvas_height,
+     respect_original_size, max_size_variation, overlap_percent, bg_color) = args_tuple
+
+    # Create a new packer instance for this batch
+    packer = ImagePacker(
+        canvas_width,
+        canvas_height,
+        respect_original_size=respect_original_size,
+        max_size_variation=max_size_variation,
+        overlap_percent=overlap_percent
+    )
+
+    # Pack images
+    packed = packer.pack(batch)
+
+    # Create collage
+    collage = packer.create_collage(background_color=bg_color)
+
+    # Save
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    collage.save(output_path, quality=95)
+
+    # Calculate statistics
+    total_image_area = sum(p.width * p.height for p in packed)
+    canvas_area = canvas_width * canvas_height
+    coverage = (total_image_area / canvas_area) * 100
+
+    stats = {
+        'batch_idx': batch_idx,
+        'output_path': output_path,
+        'num_images': len(batch),
+        'num_packed': len(packed),
+        'coverage': coverage,
+    }
+
+    # Area uniformity statistics
+    if packed and not respect_original_size:
+        areas = [p.width * p.height for p in packed]
+        avg_area = sum(areas) / len(areas)
+        max_area_diff = max(abs(area - avg_area) / avg_area * 100 for area in areas)
+        min_area = min(areas)
+        max_area = max(areas)
+
+        stats.update({
+            'avg_area': avg_area,
+            'min_area': min_area,
+            'max_area': max_area,
+            'max_area_deviation': max_area_diff,
+        })
+
+        # Aspect ratio preservation
+        max_aspect_error = 0.0
+        for p in packed:
+            actual_aspect = p.width / p.height
+            original_aspect = p.info.aspect_ratio
+            aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
+            max_aspect_error = max(max_aspect_error, aspect_error)
+        stats['max_aspect_error'] = max_aspect_error
+
+        # Overlap statistics
+        max_overlap_percent = 0.0
+        for i, p in enumerate(packed):
+            p_area = p.width * p.height
+            for j, other in enumerate(packed):
+                if i == j:
+                    continue
+                overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
+                overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
+                if overlap_x > 0 and overlap_y > 0:
+                    overlap_area = overlap_x * overlap_y
+                    overlap_percent = (overlap_area / p_area) * 100
+                    max_overlap_percent = max(max_overlap_percent, overlap_percent)
+        stats['max_overlap'] = max_overlap_percent
+
+    return stats
+
+
+def print_collage_stats(stats, total_batches):
+    """Print statistics for a completed collage."""
+    print(f"\n{'='*60}")
+    print(f"Collage {stats['batch_idx']}/{total_batches}: {stats['num_images']} images -> {stats['output_path']}")
+    print(f"{'='*60}")
+
+    if stats['num_packed'] < stats['num_images']:
+        print(f"Warning: Could only pack {stats['num_packed']} out of {stats['num_images']} images.")
+        print("Try increasing canvas size or enabling --respect-original-size")
+
+    print(f"Collage saved to {stats['output_path']}")
+    print(f"Canvas coverage: {stats['coverage']:.1f}%")
+
+    if 'avg_area' in stats:
+        print(f"Area uniformity - Average area: {stats['avg_area']:.0f}, "
+              f"Min: {stats['min_area']:.0f}, Max: {stats['max_area']:.0f}")
+        print(f"Area uniformity - Max deviation from average: {stats['max_area_deviation']:.2f}%")
+        print(f"Aspect ratio preservation - Max deviation: {stats['max_aspect_error']:.2f}%")
+        print(f"Image overlap - Max overlap: {stats['max_overlap']:.2f}% of any image's area")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Pack multiple images into a single canvas optimally.'
@@ -804,6 +915,12 @@ def main():
         '-p', '--num-collages',
         type=int,
         help='Number of collages to create (divides images evenly)'
+    )
+    parser.add_argument(
+        '-j', '--jobs',
+        type=int,
+        default=None,
+        help=f'Number of parallel jobs for creating collages (default: auto-detect, max: {cpu_count()})'
     )
 
     args = parser.parse_args()
@@ -888,68 +1005,113 @@ def main():
     else:
         output_files = [args.output]
 
+    # Determine number of parallel jobs
+    num_jobs = args.jobs if args.jobs else min(cpu_count(), len(image_batches))
+    if num_jobs > len(image_batches):
+        num_jobs = len(image_batches)
+
     # Create collages
-    for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
-        print(f"\n{'='*60}")
-        print(f"Collage {batch_idx}/{len(image_batches)}: {len(batch)} images -> {output_path}")
-        print(f"{'='*60}")
+    if len(image_batches) > 1 and num_jobs > 1:
+        # Parallel processing for multiple collages
+        print(f"\nProcessing {len(image_batches)} collages using {num_jobs} parallel workers...")
 
-        # Pack images
-        print("Packing images...")
-        packed = packer.pack(batch)
+        # Prepare arguments for parallel processing
+        job_args = []
+        for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
+            job_args.append((
+                batch_idx,
+                batch,
+                output_path,
+                args.width,
+                args.height,
+                args.respect_original_size,
+                args.max_size_variation,
+                args.overlap_percent,
+                bg_color
+            ))
 
-        if not packed or len(packed) < len(batch):
-            print(f"Warning: Could only pack {len(packed)} out of {len(batch)} images.")
-            print("Try increasing canvas size or enabling --respect-original-size")
+        # Process in parallel with progress bar
+        with Pool(processes=num_jobs) as pool:
+            results = list(tqdm(
+                pool.imap(process_single_collage, job_args),
+                total=len(job_args),
+                desc="Creating collages",
+                unit="collage"
+            ))
 
-        # Create collage
-        print("Creating collage...")
-        collage = packer.create_collage(background_color=bg_color)
+        # Print statistics for all collages
+        results.sort(key=lambda x: x['batch_idx'])
+        for stats in results:
+            print_collage_stats(stats, len(image_batches))
 
-        # Save
-        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-        collage.save(output_path, quality=95)
-        print(f"Collage saved to {output_path}")
+    else:
+        # Sequential processing (single collage or single job)
+        if len(image_batches) == 1:
+            print("\nCreating single collage...")
+        else:
+            print(f"\nCreating {len(image_batches)} collages sequentially...")
 
-        # Print statistics
-        total_image_area = sum(p.width * p.height for p in packed)
-        canvas_area = args.width * args.height
-        coverage = (total_image_area / canvas_area) * 100
-        print(f"Canvas coverage: {coverage:.1f}%")
+        for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
+            print(f"\n{'='*60}")
+            print(f"Collage {batch_idx}/{len(image_batches)}: {len(batch)} images -> {output_path}")
+            print(f"{'='*60}")
 
-        # Print area uniformity statistics
-        if packed and not args.respect_original_size:
-            areas = [p.width * p.height for p in packed]
-            avg_area = sum(areas) / len(areas)
-            max_area_diff = max(abs(area - avg_area) / avg_area * 100 for area in areas)
-            min_area = min(areas)
-            max_area = max(areas)
-            print(f"Area uniformity - Average area: {avg_area:.0f}, Min: {min_area:.0f}, Max: {max_area:.0f}")
-            print(f"Area uniformity - Max deviation from average: {max_area_diff:.2f}%")
+            # Pack images
+            print("Packing images...")
+            packed = packer.pack(batch)
 
-            # Check aspect ratio preservation
-            max_aspect_error = 0.0
-            for p in packed:
-                actual_aspect = p.width / p.height
-                original_aspect = p.info.aspect_ratio
-                aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
-                max_aspect_error = max(max_aspect_error, aspect_error)
-            print(f"Aspect ratio preservation - Max deviation: {max_aspect_error:.2f}%")
+            if not packed or len(packed) < len(batch):
+                print(f"Warning: Could only pack {len(packed)} out of {len(batch)} images.")
+                print("Try increasing canvas size or enabling --respect-original-size")
 
-            # Check overlap statistics
-            max_overlap_percent = 0.0
-            for i, p in enumerate(packed):
-                p_area = p.width * p.height
-                for j, other in enumerate(packed):
-                    if i == j:
-                        continue
-                    overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
-                    overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
-                    if overlap_x > 0 and overlap_y > 0:
-                        overlap_area = overlap_x * overlap_y
-                        overlap_percent = (overlap_area / p_area) * 100
-                        max_overlap_percent = max(max_overlap_percent, overlap_percent)
-            print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
+            # Create collage
+            print("Creating collage...")
+            collage = packer.create_collage(background_color=bg_color)
+
+            # Save
+            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+            collage.save(output_path, quality=95)
+            print(f"Collage saved to {output_path}")
+
+            # Print statistics
+            total_image_area = sum(p.width * p.height for p in packed)
+            canvas_area = args.width * args.height
+            coverage = (total_image_area / canvas_area) * 100
+            print(f"Canvas coverage: {coverage:.1f}%")
+
+            # Print area uniformity statistics
+            if packed and not args.respect_original_size:
+                areas = [p.width * p.height for p in packed]
+                avg_area = sum(areas) / len(areas)
+                max_area_diff = max(abs(area - avg_area) / avg_area * 100 for area in areas)
+                min_area = min(areas)
+                max_area = max(areas)
+                print(f"Area uniformity - Average area: {avg_area:.0f}, Min: {min_area:.0f}, Max: {max_area:.0f}")
+                print(f"Area uniformity - Max deviation from average: {max_area_diff:.2f}%")
+
+                # Check aspect ratio preservation
+                max_aspect_error = 0.0
+                for p in packed:
+                    actual_aspect = p.width / p.height
+                    original_aspect = p.info.aspect_ratio
+                    aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
+                    max_aspect_error = max(max_aspect_error, aspect_error)
+                print(f"Aspect ratio preservation - Max deviation: {max_aspect_error:.2f}%")
+
+                # Check overlap statistics
+                max_overlap_percent = 0.0
+                for i, p in enumerate(packed):
+                    p_area = p.width * p.height
+                    for j, other in enumerate(packed):
+                        if i == j:
+                            continue
+                        overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
+                        overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
+                        if overlap_x > 0 and overlap_y > 0:
+                            overlap_area = overlap_x * overlap_y
+                            overlap_percent = (overlap_area / p_area) * 100
+                            max_overlap_percent = max(max_overlap_percent, overlap_percent)
+                print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
 
     print(f"\n{'='*60}")
     print(f"✓ Created {len(image_batches)} collage(s) successfully")
