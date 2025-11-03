@@ -42,10 +42,14 @@ This will read images from `input_images/` and save to `output_images/collage.pn
 - `-W`, `--width`: Width of output canvas in pixels (required)
 - `-H`, `--height`: Height of output canvas in pixels (required)
 - `-o`, `--output`: Output file path (default: output_images/collage.png)
+- `-n`, `--images-per-collage`: Number of images per collage (creates multiple collages if needed)
+- `-p`, `--num-collages`: Number of collages to create (divides images evenly)
 - `--respect-original-size`: Maintain relative size differences between images (default: make all images roughly equal in size, then grow to fill whitespace)
-- `--max-size-variation`: Maximum percentage variation in image sizes (default: 10.0)
-- `--overlap-percent`: Percentage of overlap allowed between images (default: 5.0)
+- `--max-size-variation`: Maximum percentage variation in image area from average (default: 15.0)
+- `--overlap-percent`: Percentage of overlap allowed between images (default: 10.0)
 - `--background-color`: Background color as R,G,B (default: 255,255,255 for white)
+
+**Note:** You cannot specify both `-n` and `-p` at the same time.
 
 ### Examples
 
@@ -83,6 +87,26 @@ uv run image_packer.py -W 1920 -H 1080 --overlap-percent 10
 No overlap, minimal size variation for stricter uniformity:
 ```bash
 uv run image_packer.py -W 1920 -H 1080 --max-size-variation 5 --overlap-percent 0
+```
+
+Create multiple collages with 5 images each:
+```bash
+uv run image_packer.py -W 1920 -H 1080 -n 5
+# If you have 23 images, this creates 5 collages (4 with 5 images, 1 with 3 images)
+# Output: collage_001.png, collage_002.png, ..., collage_005.png
+```
+
+Create exactly 3 collages (divides images evenly):
+```bash
+uv run image_packer.py -W 1920 -H 1080 -p 3
+# If you have 23 images, this creates 3 collages with 8, 8, and 7 images
+# Output: collage_001.png, collage_002.png, collage_003.png
+```
+
+Create 4-image collages with custom output directory:
+```bash
+uv run image_packer.py -W 1920 -H 1080 -n 4 -o output_images/grid.png
+# Output: output_images/grid_001.png, grid_002.png, grid_003.png, etc.
 ```
 
 ## Algorithm
