@@ -16,16 +16,8 @@ A Python tool that optimally packs multiple images into a single canvas with spe
 This project uses [uv](https://github.com/astral-sh/uv) for fast, reliable Python package management.
 
 ```bash
-# Install dependencies
-uv pip install -r requirements.txt
-```
-
-Or if you have a virtual environment:
-
-```bash
-# Create a virtual environment and install dependencies
-uv venv
-uv pip install -r requirements.txt
+# Sync dependencies (creates venv and installs packages automatically)
+uv sync
 ```
 
 ## Usage
