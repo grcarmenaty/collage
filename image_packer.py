@@ -70,8 +70,8 @@ class ImagePacker:
         self.packed_images: List[PackedImage] = []
 
     def load_images(self, folder_path: str) -> List[ImageInfo]:
-        """Load all images from a folder."""
-        supported_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+        """Load all images from a folder (excludes GIFs)."""
+        supported_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
         images = []
 
         if not os.path.exists(folder_path):
