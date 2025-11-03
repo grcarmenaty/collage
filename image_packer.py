@@ -798,7 +798,8 @@ class ImagePacker:
 
 def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_per_batch: int,
                                                tolerance_percent: float, canvas_width: int,
-                                               canvas_height: int, packer_params: dict) -> List[List[ImageInfo]]:
+                                               canvas_height: int, packer_params: dict,
+                                               no_repeats: bool = False) -> List[List[ImageInfo]]:
     """
     Distribute images with flexible batch sizes to maximize coverage.
 
@@ -809,6 +810,7 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
         canvas_width: Canvas width for testing
         canvas_height: Canvas height for testing
         packer_params: Parameters for ImagePacker
+        no_repeats: If True, prevent images with same dimensions from being in same batch
 
     Returns:
         List of image batches optimized for maximum coverage
@@ -816,7 +818,7 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
     if tolerance_percent <= 0:
         # No tolerance, use standard distribution
         num_batches = (len(images) + target_per_batch - 1) // target_per_batch
-        return optimize_image_distribution(images, num_batches)
+        return optimize_image_distribution(images, num_batches, no_repeats=no_repeats)
 
     # Calculate min/max images per batch
     tolerance = tolerance_percent / 100.0
@@ -831,6 +833,9 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
     batches = []
     remaining_images = sorted_images.copy()
 
+    # Track dimensions across all batches if no_repeats is enabled
+    used_dimensions = set() if no_repeats else None
+
     # Greedy algorithm: for each batch, try different image counts and pick the best coverage
     with tqdm(desc="Optimizing batch sizes", unit="batch", leave=False) as pbar:
         while remaining_images:
@@ -841,7 +846,23 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
             # Try different batch sizes within tolerance
             for batch_size in range(min_per_batch, min(max_per_batch + 1, len(remaining_images) + 1)):
                 # Create test batch
-                test_batch = remaining_images[:batch_size]
+                if no_repeats:
+                    # Build batch while avoiding duplicate dimensions
+                    test_batch = []
+                    batch_dims = set()
+                    for img in remaining_images:
+                        img_dims = (img.original_width, img.original_height)
+                        if img_dims not in batch_dims and img_dims not in used_dimensions:
+                            test_batch.append(img)
+                            batch_dims.add(img_dims)
+                            if len(test_batch) == batch_size:
+                                break
+
+                    # If we couldn't get enough unique images, skip this batch size
+                    if len(test_batch) < min_per_batch:
+                        continue
+                else:
+                    test_batch = remaining_images[:batch_size]
 
                 # Quick test: try to pack and measure coverage
                 test_packer = ImagePacker(canvas_width, canvas_height, **packer_params)
@@ -864,14 +885,34 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
 
             if best_batch:
                 batches.append(best_batch)
-                remaining_images = remaining_images[best_count:]
-                pbar.set_postfix({'images': best_count, 'coverage': f'{best_coverage*100:.1f}%'})
+
+                if no_repeats:
+                    # Track dimensions and remove used images
+                    for img in best_batch:
+                        img_dims = (img.original_width, img.original_height)
+                        used_dimensions.add(img_dims)
+                    # Remove images in best_batch from remaining_images
+                    remaining_images = [img for img in remaining_images if img not in best_batch]
+                else:
+                    remaining_images = remaining_images[best_count:]
+
+                pbar.set_postfix({'images': len(best_batch), 'coverage': f'{best_coverage*100:.1f}%'})
                 pbar.update(1)
             else:
                 # Fallback: take minimum batch size
                 batch_size = min(min_per_batch, len(remaining_images))
-                batches.append(remaining_images[:batch_size])
-                remaining_images = remaining_images[batch_size:]
+                fallback_batch = remaining_images[:batch_size]
+                batches.append(fallback_batch)
+
+                if no_repeats:
+                    # Track dimensions for fallback batch
+                    for img in fallback_batch:
+                        img_dims = (img.original_width, img.original_height)
+                        used_dimensions.add(img_dims)
+                    remaining_images = [img for img in remaining_images if img not in fallback_batch]
+                else:
+                    remaining_images = remaining_images[batch_size:]
+
                 pbar.update(1)
 
     batch_sizes = [len(b) for b in batches]
@@ -880,7 +921,7 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
     return batches
 
 
-def optimize_image_distribution(images: List[ImageInfo], num_batches: int) -> List[List[ImageInfo]]:
+def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_repeats: bool = False) -> List[List[ImageInfo]]:
     """
     Distribute images across multiple batches to maximize coverage.
 
@@ -890,6 +931,7 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int) -> Li
     Args:
         images: List of images to distribute
         num_batches: Number of batches to create
+        no_repeats: If True, prevent images with same dimensions from being in same batch
 
     Returns:
         List of image batches optimized for packing
@@ -905,11 +947,38 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int) -> Li
     # Initialize batches
     batches = [[] for _ in range(num_batches)]
 
+    # Track dimensions in each batch if no_repeats is enabled
+    batch_dimensions = [set() for _ in range(num_batches)] if no_repeats else None
+
     # Distribute images round-robin style, alternating between batches
     # This ensures each batch gets a mix of large and small images
     for idx, img in enumerate(sorted_by_size):
-        batch_idx = idx % num_batches
-        batches[batch_idx].append(img)
+        if no_repeats:
+            # Find a batch that doesn't already have this dimension
+            img_dims = (img.original_width, img.original_height)
+            batch_idx = idx % num_batches
+            attempts = 0
+
+            # Try round-robin assignment, avoiding batches with same dimensions
+            while attempts < num_batches:
+                if img_dims not in batch_dimensions[batch_idx]:
+                    batches[batch_idx].append(img)
+                    batch_dimensions[batch_idx].add(img_dims)
+                    break
+                batch_idx = (batch_idx + 1) % num_batches
+                attempts += 1
+
+            # If we couldn't find a batch without this dimension, use the original assignment
+            # (this happens when there are more images of same size than batches)
+            if attempts == num_batches:
+                batch_idx = idx % num_batches
+                batches[batch_idx].append(img)
+                batch_dimensions[batch_idx].add(img_dims)
+                if idx < len(sorted_by_size) // num_batches + 1:  # Only warn once per dimension
+                    tqdm.write(f"Warning: Cannot avoid repeat dimensions {img_dims} - more duplicates than batches")
+        else:
+            batch_idx = idx % num_batches
+            batches[batch_idx].append(img)
 
     # Further optimize by swapping images to balance aspect ratio diversity
     # Calculate average aspect ratio per batch
@@ -1104,6 +1173,11 @@ def main():
         help='Randomize image order (default: sort by size for better packing)'
     )
     parser.add_argument(
+        '--no-repeats',
+        action='store_true',
+        help='Prevent images with the same dimensions from appearing in the same collage'
+    )
+    parser.add_argument(
         '-n', '--images-per-collage',
         type=int,
         help='Number of images per collage (creates multiple collages if needed)'
@@ -1190,13 +1264,13 @@ def main():
             }
             image_batches = optimize_image_distribution_with_tolerance(
                 images, args.images_per_collage, args.split_tolerance,
-                args.width, args.height, packer_params
+                args.width, args.height, packer_params, no_repeats=args.no_repeats
             )
             print(f"Creating {len(image_batches)} collage(s) with flexible sizing (±{args.split_tolerance}%)")
         else:
             # Standard fixed-size distribution
             num_collages = (len(images) + args.images_per_collage - 1) // args.images_per_collage
-            image_batches = optimize_image_distribution(images, num_collages)
+            image_batches = optimize_image_distribution(images, num_collages, no_repeats=args.no_repeats)
             print(f"Creating {len(image_batches)} collage(s) with optimized image distribution")
     elif args.num_collages:
         # Divide images evenly into P collages with optimized distribution
@@ -1217,7 +1291,7 @@ def main():
             }
             image_batches = optimize_image_distribution_with_tolerance(
                 images, target_per_collage, args.split_tolerance,
-                args.width, args.height, packer_params
+                args.width, args.height, packer_params, no_repeats=args.no_repeats
             )
             # Adjust if we created more/fewer batches than requested
             if len(image_batches) != num_collages:
@@ -1226,7 +1300,7 @@ def main():
                 print(f"Creating {num_collages} collage(s) with flexible sizing (±{args.split_tolerance}%)")
         else:
             # Standard fixed-size distribution
-            image_batches = optimize_image_distribution(images, num_collages)
+            image_batches = optimize_image_distribution(images, num_collages, no_repeats=args.no_repeats)
             print(f"Creating {num_collages} collage(s) with optimized image distribution")
     else:
         # Single collage with all images
