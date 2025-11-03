@@ -13,8 +13,19 @@ A Python tool that optimally packs multiple images into a single canvas with spe
 
 ## Installation
 
+This project uses [uv](https://github.com/astral-sh/uv) for fast, reliable Python package management.
+
 ```bash
-pip install -r requirements.txt
+# Install dependencies
+uv pip install -r requirements.txt
+```
+
+Or if you have a virtual environment:
+
+```bash
+# Create a virtual environment and install dependencies
+uv venv
+uv pip install -r requirements.txt
 ```
 
 ## Usage
@@ -22,7 +33,7 @@ pip install -r requirements.txt
 Basic usage:
 
 ```bash
-python image_packer.py /path/to/images -W 1920 -H 1080
+uv run image_packer.py /path/to/images -W 1920 -H 1080
 ```
 
 ### Arguments
@@ -38,17 +49,17 @@ python image_packer.py /path/to/images -W 1920 -H 1080
 
 Create a collage with default settings:
 ```bash
-python image_packer.py ./my_images -W 1920 -H 1080
+uv run image_packer.py ./my_images -W 1920 -H 1080
 ```
 
 Respect original image sizes (no upscaling):
 ```bash
-python image_packer.py ./my_images -W 1920 -H 1080 --respect-original-size
+uv run image_packer.py ./my_images -W 1920 -H 1080 --respect-original-size
 ```
 
 Custom output path and background color:
 ```bash
-python image_packer.py ./my_images -W 2560 -H 1440 -o output/collage.jpg --background-color 0,0,0
+uv run image_packer.py ./my_images -W 2560 -H 1440 -o output/collage.jpg --background-color 0,0,0
 ```
 
 ## Algorithm
