@@ -1,0 +1,16 @@
+[project]
+name = "image-packer"
+version = "0.1.0"
+description = "Optimally pack multiple images into a single canvas with specified dimensions"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+image-packer = "image_packer:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
