@@ -172,15 +172,33 @@ class ImagePacker:
                              key=lambda img: img.original_width * img.original_height,
                              reverse=True)
 
-        for img_info in sorted_images:
-            # Calculate scaled dimensions
-            scaled_width = int(img_info.original_width * scale)
-            scaled_height = int(img_info.original_height * scale)
+        # Calculate target area per image for equal sizing (when not respecting original size)
+        if not self.respect_original_size:
+            canvas_area = self.canvas_width * self.canvas_height
+            # Assume 80% packing efficiency
+            target_area_per_image = (canvas_area * 0.8) / len(images)
 
-            # Respect original size if enabled
+        for img_info in sorted_images:
             if self.respect_original_size:
+                # Use uniform scaling, respecting original size
+                scaled_width = int(img_info.original_width * scale)
+                scaled_height = int(img_info.original_height * scale)
+
+                # Do not exceed original dimensions
                 scaled_width = min(scaled_width, img_info.original_width)
                 scaled_height = min(scaled_height, img_info.original_height)
+            else:
+                # Calculate individual scale to make images roughly equal in size
+                original_area = img_info.original_width * img_info.original_height
+
+                # Scale to achieve target area
+                individual_scale = math.sqrt(target_area_per_image / original_area)
+
+                # Apply global adjustment factor
+                individual_scale *= scale
+
+                scaled_width = int(img_info.original_width * individual_scale)
+                scaled_height = int(img_info.original_height * individual_scale)
 
             # Ensure minimum size
             scaled_width = max(1, scaled_width)
@@ -289,7 +307,7 @@ def main():
     parser.add_argument(
         '--respect-original-size',
         action='store_true',
-        help='Do not scale images beyond their original size'
+        help='Respect original image sizes and proportions (default: make all images roughly equal in size)'
     )
     parser.add_argument(
         '--background-color',
