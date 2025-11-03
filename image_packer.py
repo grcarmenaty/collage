@@ -15,6 +15,7 @@ from PIL import Image
 import math
 import numpy as np
 from scipy.optimize import minimize
+from tqdm import tqdm
 
 
 @dataclass
@@ -69,25 +70,25 @@ class ImagePacker:
         if not os.path.exists(folder_path):
             raise ValueError(f"Folder not found: {folder_path}")
 
-        for filename in sorted(os.listdir(folder_path)):
-            file_path = os.path.join(folder_path, filename)
-            if not os.path.isfile(file_path):
-                continue
+        # Get list of files first to show progress
+        all_files = sorted(os.listdir(folder_path))
+        image_files = [f for f in all_files if os.path.isfile(os.path.join(folder_path, f)) and
+                      os.path.splitext(f)[1].lower() in supported_formats]
 
-            ext = os.path.splitext(filename)[1].lower()
-            if ext in supported_formats:
-                try:
-                    img = Image.open(file_path)
-                    width, height = img.size
-                    images.append(ImageInfo(
-                        path=file_path,
-                        original_width=width,
-                        original_height=height,
-                        aspect_ratio=width / height,
-                        image=img
-                    ))
-                except Exception as e:
-                    print(f"Warning: Could not load {filename}: {e}")
+        for filename in tqdm(image_files, desc="Loading images", unit="img"):
+            file_path = os.path.join(folder_path, filename)
+            try:
+                img = Image.open(file_path)
+                width, height = img.size
+                images.append(ImageInfo(
+                    path=file_path,
+                    original_width=width,
+                    original_height=height,
+                    aspect_ratio=width / height,
+                    image=img
+                ))
+            except Exception as e:
+                tqdm.write(f"Warning: Could not load {filename}: {e}")
 
         return images
 
@@ -327,106 +328,109 @@ class ImagePacker:
         max_allowed_area = (canvas_area / len(self.packed_images)) * (1 + self.max_size_variation)
 
         # Multiple aggressive growth passes - more passes for better filling
-        for growth_pass in range(5):
-            # Track if any changes were made
-            any_changes = False
+        with tqdm(total=5, desc="Growing images to fill space", unit="pass", leave=False) as pbar:
+            for growth_pass in range(5):
+                # Track if any changes were made
+                any_changes = False
 
-            # Sort by current size (smallest first) to help smaller images catch up
-            sorted_indices = sorted(range(len(self.packed_images)),
-                                  key=lambda i: self.packed_images[i].width * self.packed_images[i].height)
+                # Sort by current size (smallest first) to help smaller images catch up
+                sorted_indices = sorted(range(len(self.packed_images)),
+                                      key=lambda i: self.packed_images[i].width * self.packed_images[i].height)
 
-            for i in sorted_indices:
-                packed = self.packed_images[i]
-                current_area = packed.width * packed.height
-                initial_size = (packed.width, packed.height)
+                for i in sorted_indices:
+                    packed = self.packed_images[i]
+                    current_area = packed.width * packed.height
+                    initial_size = (packed.width, packed.height)
 
-                # Allow continued growth, but with diminishing returns
-                # Smaller images can grow more aggressively
-                size_ratio = current_area / median_area if median_area > 0 else 1.0
-                adjusted_max_area = max_allowed_area
+                    # Allow continued growth, but with diminishing returns
+                    # Smaller images can grow more aggressively
+                    size_ratio = current_area / median_area if median_area > 0 else 1.0
+                    adjusted_max_area = max_allowed_area
 
-                # If already large, reduce max allowed area
-                if size_ratio > 1.0:
-                    adjusted_max_area = current_area * (1 + (self.max_size_variation * 0.5))
+                    # If already large, reduce max allowed area
+                    if size_ratio > 1.0:
+                        adjusted_max_area = current_area * (1 + (self.max_size_variation * 0.5))
 
-                aspect_ratio = packed.info.aspect_ratio
+                    aspect_ratio = packed.info.aspect_ratio
 
-                # AGGRESSIVE STRATEGY 1: Maximum width growth with overlap allowed
-                max_width = self.canvas_width - packed.x
-                new_width = max_width
-                new_height = int(new_width / aspect_ratio)
-
-                # Check if within canvas and size variation limits
-                if new_height <= self.canvas_height - packed.y:
-                    new_area = new_width * new_height
-                    if new_area <= adjusted_max_area:
-                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                            packed.width = new_width
-                            packed.height = new_height
-                            any_changes = True
-                            continue
-
-                # AGGRESSIVE STRATEGY 2: Maximum height growth with overlap allowed
-                max_height = self.canvas_height - packed.y
-                new_height = max_height
-                new_width = int(new_height * aspect_ratio)
-
-                if new_width <= self.canvas_width - packed.x:
-                    new_area = new_width * new_height
-                    if new_area <= adjusted_max_area:
-                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                            packed.width = new_width
-                            packed.height = new_height
-                            any_changes = True
-                            continue
-
-                # AGGRESSIVE STRATEGY 3: Grow to fill available space
-                available_width = self.canvas_width - packed.x
-                available_height = self.canvas_height - packed.y
-                available_area = available_width * available_height
-
-                target_area = min(adjusted_max_area, available_area * 0.9)  # Use 90% of available
-                target_dimension = math.sqrt(target_area)
-
-                # Calculate dimensions based on aspect ratio
-                if aspect_ratio >= 1:
-                    new_height = int(target_dimension / math.sqrt(aspect_ratio))
-                    new_width = int(new_height * aspect_ratio)
-                else:
-                    new_width = int(target_dimension * math.sqrt(aspect_ratio))
+                    # AGGRESSIVE STRATEGY 1: Maximum width growth with overlap allowed
+                    max_width = self.canvas_width - packed.x
+                    new_width = max_width
                     new_height = int(new_width / aspect_ratio)
 
-                # Make sure we fit in canvas
-                new_width = min(new_width, self.canvas_width - packed.x)
-                new_height = min(new_height, self.canvas_height - packed.y)
+                    # Check if within canvas and size variation limits
+                    if new_height <= self.canvas_height - packed.y:
+                        new_area = new_width * new_height
+                        if new_area <= adjusted_max_area:
+                            if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                packed.width = new_width
+                                packed.height = new_height
+                                any_changes = True
+                                continue
 
-                if new_width > packed.width and new_height > packed.height:
-                    if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                        packed.width = new_width
-                        packed.height = new_height
-                        any_changes = True
-                        continue
+                    # AGGRESSIVE STRATEGY 2: Maximum height growth with overlap allowed
+                    max_height = self.canvas_height - packed.y
+                    new_height = max_height
+                    new_width = int(new_height * aspect_ratio)
 
-                # AGGRESSIVE STRATEGY 4: Incremental growth with overlap
-                # Try to grow by 30% each iteration
-                growth_factor = 1.3
-                new_width = int(packed.width * growth_factor)
-                new_height = int(packed.height * growth_factor)
+                    if new_width <= self.canvas_width - packed.x:
+                        new_area = new_width * new_height
+                        if new_area <= adjusted_max_area:
+                            if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                packed.width = new_width
+                                packed.height = new_height
+                                any_changes = True
+                                continue
 
-                # Constrain to canvas
-                new_width = min(new_width, self.canvas_width - packed.x)
-                new_height = min(new_height, self.canvas_height - packed.y)
+                    # AGGRESSIVE STRATEGY 3: Grow to fill available space
+                    available_width = self.canvas_width - packed.x
+                    available_height = self.canvas_height - packed.y
+                    available_area = available_width * available_height
 
-                new_area = new_width * new_height
-                if new_area <= adjusted_max_area and (new_width > packed.width or new_height > packed.height):
-                    if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                        packed.width = new_width
-                        packed.height = new_height
-                        any_changes = True
+                    target_area = min(adjusted_max_area, available_area * 0.9)  # Use 90% of available
+                    target_dimension = math.sqrt(target_area)
 
-            # If no changes were made in this pass, we're done
-            if not any_changes:
-                break
+                    # Calculate dimensions based on aspect ratio
+                    if aspect_ratio >= 1:
+                        new_height = int(target_dimension / math.sqrt(aspect_ratio))
+                        new_width = int(new_height * aspect_ratio)
+                    else:
+                        new_width = int(target_dimension * math.sqrt(aspect_ratio))
+                        new_height = int(new_width / aspect_ratio)
+
+                    # Make sure we fit in canvas
+                    new_width = min(new_width, self.canvas_width - packed.x)
+                    new_height = min(new_height, self.canvas_height - packed.y)
+
+                    if new_width > packed.width and new_height > packed.height:
+                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                            packed.width = new_width
+                            packed.height = new_height
+                            any_changes = True
+                            continue
+
+                    # AGGRESSIVE STRATEGY 4: Incremental growth with overlap
+                    # Try to grow by 30% each iteration
+                    growth_factor = 1.3
+                    new_width = int(packed.width * growth_factor)
+                    new_height = int(packed.height * growth_factor)
+
+                    # Constrain to canvas
+                    new_width = min(new_width, self.canvas_width - packed.x)
+                    new_height = min(new_height, self.canvas_height - packed.y)
+
+                    new_area = new_width * new_height
+                    if new_area <= adjusted_max_area and (new_width > packed.width or new_height > packed.height):
+                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                            packed.width = new_width
+                            packed.height = new_height
+                            any_changes = True
+
+                # If no changes were made in this pass, we're done
+                if not any_changes:
+                    break
+
+                pbar.update(1)
 
     def enforce_area_uniformity(self, max_area_variation: float = 0.05):
         """
@@ -462,157 +466,163 @@ class ImagePacker:
         positions_y = np.array([p.y for p in self.packed_images])
 
         # Iteratively enforce area uniformity
-        for iteration in range(max_iterations):
-            # Calculate current average area
-            current_areas = np.array([p.width * p.height for p in self.packed_images])
-            avg_area = np.mean(current_areas)
-            min_area = max(1, avg_area * (1 - max_area_variation))
-            max_area = avg_area * (1 + max_area_variation)
+        with tqdm(total=max_iterations, desc="Enforcing area uniformity", unit="iter") as pbar:
+            for iteration in range(max_iterations):
+                # Calculate current average area
+                current_areas = np.array([p.width * p.height for p in self.packed_images])
+                avg_area = np.mean(current_areas)
+                min_area = max(1, avg_area * (1 - max_area_variation))
+                max_area = avg_area * (1 + max_area_variation)
 
-            # Check if all images meet the area constraint
-            areas_in_range = np.all((current_areas >= min_area) & (current_areas <= max_area))
+                # Check if all images meet the area constraint
+                areas_in_range = np.all((current_areas >= min_area) & (current_areas <= max_area))
 
-            if areas_in_range:
-                # Success! All images meet the area constraint
-                print(f"Area uniformity achieved after {iteration} iterations")
-                break
+                # Update progress bar with current deviation
+                max_deviation = np.max(np.abs(current_areas - avg_area) / avg_area) * 100
+                pbar.set_postfix({'max_dev': f'{max_deviation:.2f}%'})
+                pbar.update(1)
 
-            # Update reference sizes for this iteration
-            current_widths = np.array([p.width for p in self.packed_images])
-            current_heights = np.array([p.height for p in self.packed_images])
+                if areas_in_range:
+                    # Success! All images meet the area constraint
+                    pbar.set_description(f"✓ Area uniformity achieved")
+                    break
 
-            # Initial guess: scale factors to bring areas closer to average
-            x0 = np.sqrt(avg_area / current_areas)
+                # Update reference sizes for this iteration
+                current_widths = np.array([p.width for p in self.packed_images])
+                current_heights = np.array([p.height for p in self.packed_images])
 
-            def get_dimensions(scales):
-                """Calculate widths and heights from scale factors."""
-                widths = current_widths * scales
-                heights = current_heights * scales
-                return widths, heights
+                # Initial guess: scale factors to bring areas closer to average
+                x0 = np.sqrt(avg_area / current_areas)
 
-            def objective(scales):
-                """Minimize deviation from uniform area."""
-                widths, heights = get_dimensions(scales)
-                areas = widths * heights
-                # Strongly penalize deviation from average area
-                uniformity_penalty = np.sum((areas - avg_area) ** 2)
-                return uniformity_penalty
+                def get_dimensions(scales):
+                    """Calculate widths and heights from scale factors."""
+                    widths = current_widths * scales
+                    heights = current_heights * scales
+                    return widths, heights
 
-            def overlap_constraint(scales, i, j):
-                """Constraint: overlap between images i and j must be <= overlap_percent."""
-                widths, heights = get_dimensions(scales)
+                def objective(scales):
+                    """Minimize deviation from uniform area."""
+                    widths, heights = get_dimensions(scales)
+                    areas = widths * heights
+                    # Strongly penalize deviation from average area
+                    uniformity_penalty = np.sum((areas - avg_area) ** 2)
+                    return uniformity_penalty
 
-                # Calculate overlap
-                x1, y1, w1, h1 = positions_x[i], positions_y[i], widths[i], heights[i]
-                x2, y2, w2, h2 = positions_x[j], positions_y[j], widths[j], heights[j]
+                def overlap_constraint(scales, i, j):
+                    """Constraint: overlap between images i and j must be <= overlap_percent."""
+                    widths, heights = get_dimensions(scales)
 
-                overlap_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-                overlap_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+                    # Calculate overlap
+                    x1, y1, w1, h1 = positions_x[i], positions_y[i], widths[i], heights[i]
+                    x2, y2, w2, h2 = positions_x[j], positions_y[j], widths[j], heights[j]
 
-                if overlap_x > 0 and overlap_y > 0:
-                    overlap_area = overlap_x * overlap_y
-                    area1 = w1 * h1
-                    area2 = w2 * h2
+                    overlap_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+                    overlap_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
 
-                    # Constraint: overlap_area / area1 <= overlap_percent (return non-negative when satisfied)
-                    max_overlap_1 = area1 * self.overlap_percent - overlap_area
-                    max_overlap_2 = area2 * self.overlap_percent - overlap_area
+                    if overlap_x > 0 and overlap_y > 0:
+                        overlap_area = overlap_x * overlap_y
+                        area1 = w1 * h1
+                        area2 = w2 * h2
 
-                    return min(max_overlap_1, max_overlap_2)
+                        # Constraint: overlap_area / area1 <= overlap_percent (return non-negative when satisfied)
+                        max_overlap_1 = area1 * self.overlap_percent - overlap_area
+                        max_overlap_2 = area2 * self.overlap_percent - overlap_area
 
-                return 0.0  # No overlap is always OK
+                        return min(max_overlap_1, max_overlap_2)
 
-            def canvas_constraint_width(scales, i):
-                """Constraint: image i must fit within canvas width."""
-                widths, _ = get_dimensions(scales)
-                return self.canvas_width - (positions_x[i] + widths[i])
+                    return 0.0  # No overlap is always OK
 
-            def canvas_constraint_height(scales, i):
-                """Constraint: image i must fit within canvas height."""
-                _, heights = get_dimensions(scales)
-                return self.canvas_height - (positions_y[i] + heights[i])
+                def canvas_constraint_width(scales, i):
+                    """Constraint: image i must fit within canvas width."""
+                    widths, _ = get_dimensions(scales)
+                    return self.canvas_width - (positions_x[i] + widths[i])
 
-            def area_constraint_min(scales, i):
-                """Constraint: image i area must be >= min_area."""
-                widths, heights = get_dimensions(scales)
-                area = widths[i] * heights[i]
-                return area - min_area
+                def canvas_constraint_height(scales, i):
+                    """Constraint: image i must fit within canvas height."""
+                    _, heights = get_dimensions(scales)
+                    return self.canvas_height - (positions_y[i] + heights[i])
 
-            def area_constraint_max(scales, i):
-                """Constraint: image i area must be <= max_area."""
-                widths, heights = get_dimensions(scales)
-                area = widths[i] * heights[i]
-                return max_area - area
+                def area_constraint_min(scales, i):
+                    """Constraint: image i area must be >= min_area."""
+                    widths, heights = get_dimensions(scales)
+                    area = widths[i] * heights[i]
+                    return area - min_area
 
-            # Build constraints list
-            constraints = []
+                def area_constraint_max(scales, i):
+                    """Constraint: image i area must be <= max_area."""
+                    widths, heights = get_dimensions(scales)
+                    area = widths[i] * heights[i]
+                    return max_area - area
 
-            # Overlap constraints for all pairs
-            for i in range(n):
-                for j in range(i + 1, n):
-                    constraints.append({
-                        'type': 'ineq',
-                        'fun': overlap_constraint,
-                        'args': (i, j)
-                    })
+                # Build constraints list
+                constraints = []
 
-            # Canvas bounds and area constraints
-            for i in range(n):
-                constraints.append({'type': 'ineq', 'fun': canvas_constraint_width, 'args': (i,)})
-                constraints.append({'type': 'ineq', 'fun': canvas_constraint_height, 'args': (i,)})
-                constraints.append({'type': 'ineq', 'fun': area_constraint_min, 'args': (i,)})
-                constraints.append({'type': 'ineq', 'fun': area_constraint_max, 'args': (i,)})
+                # Overlap constraints for all pairs
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        constraints.append({
+                            'type': 'ineq',
+                            'fun': overlap_constraint,
+                            'args': (i, j)
+                        })
 
-            # Bounds: scales must be positive, allow wider range for adjustment
-            bounds = [(0.1, 3.0) for _ in range(n)]
+                # Canvas bounds and area constraints
+                for i in range(n):
+                    constraints.append({'type': 'ineq', 'fun': canvas_constraint_width, 'args': (i,)})
+                    constraints.append({'type': 'ineq', 'fun': canvas_constraint_height, 'args': (i,)})
+                    constraints.append({'type': 'ineq', 'fun': area_constraint_min, 'args': (i,)})
+                    constraints.append({'type': 'ineq', 'fun': area_constraint_max, 'args': (i,)})
 
-            # Solve optimization problem with tighter tolerance
-            result = minimize(
-                objective,
-                x0,
-                method='SLSQP',
-                bounds=bounds,
-                constraints=constraints,
-                options={'maxiter': 2000, 'ftol': 1e-9}
-            )
+                # Bounds: scales must be positive, allow wider range for adjustment
+                bounds = [(0.1, 3.0) for _ in range(n)]
 
-            # Apply optimized scales
-            if result.success:
-                optimal_scales = result.x
-                for i, packed in enumerate(self.packed_images):
-                    new_width = int(current_widths[i] * optimal_scales[i])
-                    new_height = int(current_heights[i] * optimal_scales[i])
-                    packed.width = max(1, new_width)
-                    packed.height = max(1, new_height)
-            else:
-                # If optimization fails, try aggressive shrinking to meet constraints
-                print(f"Optimization failed at iteration {iteration}, trying fallback strategy")
-                for i, packed in enumerate(self.packed_images):
-                    current_area = current_areas[i]
+                # Solve optimization problem with tighter tolerance
+                result = minimize(
+                    objective,
+                    x0,
+                    method='SLSQP',
+                    bounds=bounds,
+                    constraints=constraints,
+                    options={'maxiter': 2000, 'ftol': 1e-9}
+                )
 
-                    # If too large, shrink to max_area
-                    if current_area > max_area:
-                        scale = math.sqrt(max_area / current_area) * 0.95  # 95% to ensure we're under
-                        new_width = int(current_widths[i] * scale)
-                        new_height = int(current_heights[i] * scale)
+                # Apply optimized scales
+                if result.success:
+                    optimal_scales = result.x
+                    for i, packed in enumerate(self.packed_images):
+                        new_width = int(current_widths[i] * optimal_scales[i])
+                        new_height = int(current_heights[i] * optimal_scales[i])
+                        packed.width = max(1, new_width)
+                        packed.height = max(1, new_height)
+                else:
+                    # If optimization fails, try aggressive shrinking to meet constraints
+                    pbar.write(f"Optimization failed at iteration {iteration}, trying fallback strategy")
+                    for i, packed in enumerate(self.packed_images):
+                        current_area = current_areas[i]
 
-                        if (new_width <= self.canvas_width - packed.x and
-                            new_height <= self.canvas_height - packed.y):
-                            if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                                packed.width = max(1, new_width)
-                                packed.height = max(1, new_height)
+                        # If too large, shrink to max_area
+                        if current_area > max_area:
+                            scale = math.sqrt(max_area / current_area) * 0.95  # 95% to ensure we're under
+                            new_width = int(current_widths[i] * scale)
+                            new_height = int(current_heights[i] * scale)
 
-                    # If too small, try to grow to min_area
-                    elif current_area < min_area:
-                        scale = math.sqrt(min_area / current_area) * 1.05  # 105% to ensure we're over
-                        new_width = int(current_widths[i] * scale)
-                        new_height = int(current_heights[i] * scale)
+                            if (new_width <= self.canvas_width - packed.x and
+                                new_height <= self.canvas_height - packed.y):
+                                if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                    packed.width = max(1, new_width)
+                                    packed.height = max(1, new_height)
 
-                        if (new_width <= self.canvas_width - packed.x and
-                            new_height <= self.canvas_height - packed.y):
-                            if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                                packed.width = max(1, new_width)
-                                packed.height = max(1, new_height)
+                        # If too small, try to grow to min_area
+                        elif current_area < min_area:
+                            scale = math.sqrt(min_area / current_area) * 1.05  # 105% to ensure we're over
+                            new_width = int(current_widths[i] * scale)
+                            new_height = int(current_heights[i] * scale)
+
+                            if (new_width <= self.canvas_width - packed.x and
+                                new_height <= self.canvas_height - packed.y):
+                                if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                    packed.width = max(1, new_width)
+                                    packed.height = max(1, new_height)
 
         # Final check
         final_areas = np.array([p.width * p.height for p in self.packed_images])
@@ -690,14 +700,18 @@ class ImagePacker:
 
         # Try to find the largest scale that fits all images
         # More iterations for better precision = better space utilization
-        for _ in range(30):
-            mid_scale = (min_scale + max_scale) / 2
+        with tqdm(total=30, desc="Finding optimal scale", unit="iter", leave=False) as pbar:
+            for _ in range(30):
+                mid_scale = (min_scale + max_scale) / 2
 
-            if self.try_pack_with_scale(images, mid_scale):
-                best_scale = mid_scale
-                min_scale = mid_scale
-            else:
-                max_scale = mid_scale
+                if self.try_pack_with_scale(images, mid_scale):
+                    best_scale = mid_scale
+                    min_scale = mid_scale
+                else:
+                    max_scale = mid_scale
+
+                pbar.set_postfix({'scale': f'{best_scale:.4f}'})
+                pbar.update(1)
 
         # Pack with the best scale found
         self.try_pack_with_scale(images, best_scale)
