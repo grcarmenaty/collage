@@ -429,7 +429,8 @@ class ImagePacker:
     def enforce_size_uniformity(self, max_dimension_variation: float = 0.05):
         """
         Enforce strict size uniformity by ensuring no image dimension differs
-        by more than max_dimension_variation from the average.
+        by more than max_dimension_variation from the average, while maintaining
+        aspect ratios.
 
         Args:
             max_dimension_variation: Maximum allowed variation (default 0.05 = 5%)
@@ -447,41 +448,83 @@ class ImagePacker:
         min_height = max(1, int(avg_height * (1 - max_dimension_variation)))
         max_height = int(avg_height * (1 + max_dimension_variation))
 
-        # Adjust each image to fit within the constraints
+        # Adjust each image to fit within the constraints while maintaining aspect ratio
         for packed in self.packed_images:
             aspect_ratio = packed.info.aspect_ratio
 
-            # Clamp width to allowed range
-            new_width = max(min_width, min(packed.width, max_width))
-            # Clamp height to allowed range
-            new_height = max(min_height, min(packed.height, max_height))
+            # Start with current dimensions clamped to allowed ranges
+            clamped_width = max(min_width, min(packed.width, max_width))
+            clamped_height = max(min_height, min(packed.height, max_height))
 
             # Try to maintain aspect ratio while respecting both constraints
-            # Calculate what height would be needed for this width
-            height_for_width = int(new_width / aspect_ratio)
-            # Calculate what width would be needed for this height
-            width_for_height = int(new_height * aspect_ratio)
-
-            # Choose the combination that keeps both dimensions in range
+            # Strategy 1: Use width, calculate height from aspect ratio
+            height_for_width = int(clamped_width / aspect_ratio)
             if min_height <= height_for_width <= max_height:
-                # Use width-based sizing
-                packed.width = new_width
+                # This works - use it
+                packed.width = clamped_width
                 packed.height = height_for_width
-            elif min_width <= width_for_height <= max_width:
-                # Use height-based sizing
-                packed.width = width_for_height
-                packed.height = new_height
             else:
-                # Can't maintain aspect ratio perfectly, use clamped values
-                packed.width = new_width
-                packed.height = new_height
+                # Strategy 2: Use height, calculate width from aspect ratio
+                width_for_height = int(clamped_height * aspect_ratio)
+                if min_width <= width_for_height <= max_width:
+                    # This works - use it
+                    packed.width = width_for_height
+                    packed.height = clamped_height
+                else:
+                    # Strategy 3: Find the largest size that fits both constraints with correct aspect ratio
+                    # Try using the average dimensions as a target
+                    target_width = avg_width
+                    target_height = int(target_width / aspect_ratio)
+
+                    if min_height <= target_height <= max_height:
+                        packed.width = int(target_width)
+                        packed.height = target_height
+                    else:
+                        # Use height-based approach with average height
+                        target_height = avg_height
+                        target_width = int(target_height * aspect_ratio)
+
+                        if min_width <= target_width <= max_width:
+                            packed.width = target_width
+                            packed.height = int(target_height)
+                        else:
+                            # Final fallback: find the best compromise
+                            # Scale down/up to fit within constraints
+                            if aspect_ratio >= 1:
+                                # Wider than tall - constrain by width
+                                packed.width = int(avg_width)
+                                packed.height = int(packed.width / aspect_ratio)
+                                # Clamp height if needed
+                                if packed.height > max_height:
+                                    packed.height = max_height
+                                    packed.width = int(packed.height * aspect_ratio)
+                                elif packed.height < min_height:
+                                    packed.height = min_height
+                                    packed.width = int(packed.height * aspect_ratio)
+                            else:
+                                # Taller than wide - constrain by height
+                                packed.height = int(avg_height)
+                                packed.width = int(packed.height * aspect_ratio)
+                                # Clamp width if needed
+                                if packed.width > max_width:
+                                    packed.width = max_width
+                                    packed.height = int(packed.width / aspect_ratio)
+                                elif packed.width < min_width:
+                                    packed.width = min_width
+                                    packed.height = int(packed.width / aspect_ratio)
 
             # Ensure we stay within canvas bounds and maintain minimum size
             available_width = self.canvas_width - packed.x
             available_height = self.canvas_height - packed.y
 
-            packed.width = max(1, min(packed.width, available_width))
-            packed.height = max(1, min(packed.height, available_height))
+            # If we exceed canvas bounds, scale down while maintaining aspect ratio
+            if packed.width > available_width:
+                packed.width = available_width
+                packed.height = int(packed.width / aspect_ratio)
+
+            if packed.height > available_height:
+                packed.height = available_height
+                packed.width = int(packed.height * aspect_ratio)
 
             # Final safety check - ensure positive dimensions
             packed.width = max(1, int(packed.width))
@@ -490,13 +533,13 @@ class ImagePacker:
     def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
         """
         Check if a rectangle at (x, y) with given dimensions is valid.
-        Allows overlaps up to overlap_percent of the smaller dimension.
+        Ensures that no more than overlap_percent of EACH image's own area overlaps with any other.
         """
         # Check canvas boundaries
         if x + width > self.canvas_width or y + height > self.canvas_height:
             return False
 
-        # Check overlap with other images - allow up to overlap_percent
+        # Check overlap with other images - ensure no more than overlap_percent of each image's own area overlaps
         for i, other in enumerate(self.packed_images):
             if i == exclude_index:
                 continue
@@ -506,14 +549,16 @@ class ImagePacker:
             overlap_y = max(0, min(y + height, other.y + other.height) - max(y, other.y))
 
             if overlap_x > 0 and overlap_y > 0:
-                # Calculate overlap as percentage of the smaller image
                 overlap_area = overlap_x * overlap_y
                 this_area = width * height
                 other_area = other.width * other.height
-                smaller_area = min(this_area, other_area)
 
-                # If overlap exceeds allowed percentage, reject
-                if overlap_area > smaller_area * self.overlap_percent:
+                # Check if overlap exceeds allowed percentage of THIS image's area
+                if overlap_area > this_area * self.overlap_percent:
+                    return False
+
+                # Also check if overlap exceeds allowed percentage of OTHER image's area
+                if overlap_area > other_area * self.overlap_percent:
                     return False
 
         return True
@@ -705,6 +750,30 @@ def main():
         max_width_diff = max(abs(p.width - avg_width) / avg_width * 100 for p in packed)
         max_height_diff = max(abs(p.height - avg_height) / avg_height * 100 for p in packed)
         print(f"Size uniformity - Max width deviation: {max_width_diff:.2f}%, Max height deviation: {max_height_diff:.2f}%")
+
+        # Check aspect ratio preservation
+        max_aspect_error = 0.0
+        for p in packed:
+            actual_aspect = p.width / p.height
+            original_aspect = p.info.aspect_ratio
+            aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
+            max_aspect_error = max(max_aspect_error, aspect_error)
+        print(f"Aspect ratio preservation - Max deviation: {max_aspect_error:.2f}%")
+
+        # Check overlap statistics
+        max_overlap_percent = 0.0
+        for i, p in enumerate(packed):
+            p_area = p.width * p.height
+            for j, other in enumerate(packed):
+                if i == j:
+                    continue
+                overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
+                overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
+                if overlap_x > 0 and overlap_y > 0:
+                    overlap_area = overlap_x * overlap_y
+                    overlap_percent = (overlap_area / p_area) * 100
+                    max_overlap_percent = max(max_overlap_percent, overlap_percent)
+        print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
 
     return 0
 
