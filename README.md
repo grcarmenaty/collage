@@ -5,11 +5,12 @@ A Python tool that optimally packs multiple images into a single canvas with spe
 ## Features
 
 - **Maximum Space Utilization**: Aggressively fills the canvas to maximize image sizes
+- **Post-Packing Growth**: After initial packing, images are grown to fill remaining whitespace (allows slight size variations to eliminate gaps)
 - **Optimal Packing**: Uses a guillotine-based bin packing algorithm with precise binary search
 - **Aspect Ratio Preservation**: All images maintain their original aspect ratios
 - **Equal Sizing**: By default, all images are scaled to roughly equal sizes for a uniform look
 - **Flexible Scaling Modes**:
-  - Default mode: Makes all images roughly equal in size while maximizing total coverage
+  - Default mode: Makes all images roughly equal in size, then grows them to fill whitespace (prioritizes space over perfect equality)
   - `--respect-original-size`: Maintains relative size differences between images
 - **Whitespace Minimization**: Intelligently arranges images to minimize gaps
 - **Multiple Format Support**: Supports JPG, PNG, BMP, GIF, TIFF, and WebP formats
@@ -25,36 +26,44 @@ uv sync
 
 ## Usage
 
-Basic usage:
+Basic usage (uses default folders):
 
 ```bash
-uv run image_packer.py /path/to/images -W 1920 -H 1080
+uv run image_packer.py -W 1920 -H 1080
 ```
+
+This will read images from `input_images/` and save to `output_images/collage.png`.
 
 ### Arguments
 
-- `folder`: Path to folder containing images (required)
+- `folder`: Path to folder containing images (default: input_images)
 - `-W`, `--width`: Width of output canvas in pixels (required)
 - `-H`, `--height`: Height of output canvas in pixels (required)
-- `-o`, `--output`: Output file path (default: collage.png)
-- `--respect-original-size`: Maintain relative size differences between images (default: make all images roughly equal in size)
+- `-o`, `--output`: Output file path (default: output_images/collage.png)
+- `--respect-original-size`: Maintain relative size differences between images (default: make all images roughly equal in size, then grow to fill whitespace)
 - `--background-color`: Background color as R,G,B (default: 255,255,255 for white)
 
 ### Examples
 
-Create a collage with equal-sized images (default behavior):
+Create a collage with default folders:
 ```bash
-uv run image_packer.py input_images -W 1920 -H 1080
+# Place images in input_images/ folder first
+uv run image_packer.py -W 1920 -H 1080
 ```
 
-Preserve relative size differences between images:
+Specify custom input folder:
 ```bash
-uv run image_packer.py input_images -W 1920 -H 1080 --respect-original-size
+uv run image_packer.py /path/to/images -W 1920 -H 1080
+```
+
+Preserve relative size differences between images (no post-packing growth):
+```bash
+uv run image_packer.py -W 1920 -H 1080 --respect-original-size
 ```
 
 Custom output path and background color:
 ```bash
-uv run image_packer.py input_images -W 2560 -H 1440 -o output_images/collage.jpg --background-color 0,0,0
+uv run image_packer.py -W 2560 -H 1440 -o my_collage.jpg --background-color 0,0,0
 ```
 
 ## Algorithm
@@ -78,7 +87,8 @@ Images are sorted by area (largest first) for better packing efficiency.
 3. For each image, it finds the best-fitting free rectangle using a best-fit strategy
 4. After placing an image, it splits the used rectangle into new free rectangles
 5. **Binary search with 30 iterations** precisely finds the maximum scale factor that allows all images to fit, maximizing space occupation
-6. The final collage is rendered with all images at their optimized positions and sizes
+6. **Post-packing growth** (default mode only): Each image is grown to fill adjacent whitespace while maintaining aspect ratio, allowing slight size variations to eliminate gaps
+7. The final collage is rendered with all images at their optimized positions and sizes
 
 ### Space Maximization
 
@@ -87,11 +97,12 @@ The algorithm uses several techniques to maximize canvas utilization:
 - **Precise binary search**: 30 iterations ensure near-optimal scaling
 - **Aggressive upper bounds**: Explores up to 3x the estimated scale to find all possible solutions
 - **Best-fit placement**: Minimizes wasted space when placing each image
+- **Post-packing growth**: Images are expanded into remaining whitespace after initial packing (prioritizes space utilization over perfect size equality)
 
 ## Project Structure
 
-- `input_images/` - Place your source images here
-- `output_images/` - Generated collages will be saved here (by default in the root directory)
+- `input_images/` - Default folder for source images
+- `output_images/` - Default folder for generated collages
 
 ## Output
 
