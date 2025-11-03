@@ -796,6 +796,90 @@ class ImagePacker:
         return canvas
 
 
+def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_per_batch: int,
+                                               tolerance_percent: float, canvas_width: int,
+                                               canvas_height: int, packer_params: dict) -> List[List[ImageInfo]]:
+    """
+    Distribute images with flexible batch sizes to maximize coverage.
+
+    Args:
+        images: List of images to distribute
+        target_per_batch: Target number of images per batch
+        tolerance_percent: Allowed percentage deviation (e.g., 20 = ±20%)
+        canvas_width: Canvas width for testing
+        canvas_height: Canvas height for testing
+        packer_params: Parameters for ImagePacker
+
+    Returns:
+        List of image batches optimized for maximum coverage
+    """
+    if tolerance_percent <= 0:
+        # No tolerance, use standard distribution
+        num_batches = (len(images) + target_per_batch - 1) // target_per_batch
+        return optimize_image_distribution(images, num_batches)
+
+    # Calculate min/max images per batch
+    tolerance = tolerance_percent / 100.0
+    min_per_batch = max(1, int(target_per_batch * (1 - tolerance)))
+    max_per_batch = int(target_per_batch * (1 + tolerance))
+
+    tqdm.write(f"Split tolerance: {tolerance_percent}% → {min_per_batch}-{max_per_batch} images per canvas")
+
+    # Sort images by area for consistent distribution
+    sorted_images = sorted(images, key=lambda img: img.original_width * img.original_height, reverse=True)
+
+    batches = []
+    remaining_images = sorted_images.copy()
+
+    # Greedy algorithm: for each batch, try different image counts and pick the best coverage
+    with tqdm(desc="Optimizing batch sizes", unit="batch", leave=False) as pbar:
+        while remaining_images:
+            best_batch = None
+            best_coverage = 0
+            best_count = target_per_batch
+
+            # Try different batch sizes within tolerance
+            for batch_size in range(min_per_batch, min(max_per_batch + 1, len(remaining_images) + 1)):
+                # Create test batch
+                test_batch = remaining_images[:batch_size]
+
+                # Quick test: try to pack and measure coverage
+                test_packer = ImagePacker(canvas_width, canvas_height, **packer_params)
+                test_packer.pack(test_batch)
+
+                if test_packer.packed_images:
+                    # Calculate coverage
+                    total_area = sum(p.width * p.height for p in test_packer.packed_images)
+                    canvas_area = canvas_width * canvas_height
+                    coverage = total_area / canvas_area
+
+                    # Prefer higher coverage, but also consider using more images
+                    # Score = coverage + small bonus for using more images (within reason)
+                    score = coverage + (batch_size / target_per_batch) * 0.1
+
+                    if score > best_coverage:
+                        best_coverage = score
+                        best_batch = test_batch
+                        best_count = batch_size
+
+            if best_batch:
+                batches.append(best_batch)
+                remaining_images = remaining_images[best_count:]
+                pbar.set_postfix({'images': best_count, 'coverage': f'{best_coverage*100:.1f}%'})
+                pbar.update(1)
+            else:
+                # Fallback: take minimum batch size
+                batch_size = min(min_per_batch, len(remaining_images))
+                batches.append(remaining_images[:batch_size])
+                remaining_images = remaining_images[batch_size:]
+                pbar.update(1)
+
+    batch_sizes = [len(b) for b in batches]
+    tqdm.write(f"Optimized distribution: {batch_sizes} images per canvas")
+
+    return batches
+
+
 def optimize_image_distribution(images: List[ImageInfo], num_batches: int) -> List[List[ImageInfo]]:
     """
     Distribute images across multiple batches to maximize coverage.
@@ -1030,6 +1114,12 @@ def main():
         help='Number of collages to create (divides images evenly)'
     )
     parser.add_argument(
+        '--split-tolerance',
+        type=float,
+        default=0,
+        help='Percentage flexibility in images per canvas to maximize coverage (e.g., 20 allows ±20%% from target)'
+    )
+    parser.add_argument(
         '-j', '--jobs',
         type=int,
         default=None,
@@ -1042,6 +1132,14 @@ def main():
     if args.images_per_collage and args.num_collages:
         print("Error: Cannot specify both -n/--images-per-collage and -p/--num-collages")
         return 1
+
+    if args.split_tolerance < 0 or args.split_tolerance > 100:
+        print("Error: --split-tolerance must be between 0 and 100")
+        return 1
+
+    if args.split_tolerance > 0 and not (args.images_per_collage or args.num_collages):
+        print("Warning: --split-tolerance requires -n or -p flag to have effect")
+
 
     # Parse background color
     try:
@@ -1080,10 +1178,26 @@ def main():
     # Determine batching strategy with optimized distribution
     image_batches = []
     if args.images_per_collage:
-        # Create batches of N images each with optimized distribution
-        num_collages = (len(images) + args.images_per_collage - 1) // args.images_per_collage
-        image_batches = optimize_image_distribution(images, num_collages)
-        print(f"Creating {len(image_batches)} collage(s) with optimized image distribution")
+        # Create batches with flexible sizes using split-tolerance
+        if args.split_tolerance > 0:
+            # Use tolerance-based distribution for maximum coverage
+            packer_params = {
+                'respect_original_size': args.respect_original_size,
+                'max_size_variation': args.max_size_variation,
+                'overlap_percent': args.overlap_percent,
+                'no_uniformity': args.no_uniformity,
+                'randomize': args.randomize
+            }
+            image_batches = optimize_image_distribution_with_tolerance(
+                images, args.images_per_collage, args.split_tolerance,
+                args.width, args.height, packer_params
+            )
+            print(f"Creating {len(image_batches)} collage(s) with flexible sizing (±{args.split_tolerance}%)")
+        else:
+            # Standard fixed-size distribution
+            num_collages = (len(images) + args.images_per_collage - 1) // args.images_per_collage
+            image_batches = optimize_image_distribution(images, num_collages)
+            print(f"Creating {len(image_batches)} collage(s) with optimized image distribution")
     elif args.num_collages:
         # Divide images evenly into P collages with optimized distribution
         num_collages = args.num_collages
@@ -1091,8 +1205,29 @@ def main():
             print(f"Warning: Requested {num_collages} collages but only {len(images)} images available")
             num_collages = len(images)
 
-        image_batches = optimize_image_distribution(images, num_collages)
-        print(f"Creating {num_collages} collage(s) with optimized image distribution")
+        if args.split_tolerance > 0:
+            # Calculate target per collage and use tolerance-based distribution
+            target_per_collage = len(images) // num_collages
+            packer_params = {
+                'respect_original_size': args.respect_original_size,
+                'max_size_variation': args.max_size_variation,
+                'overlap_percent': args.overlap_percent,
+                'no_uniformity': args.no_uniformity,
+                'randomize': args.randomize
+            }
+            image_batches = optimize_image_distribution_with_tolerance(
+                images, target_per_collage, args.split_tolerance,
+                args.width, args.height, packer_params
+            )
+            # Adjust if we created more/fewer batches than requested
+            if len(image_batches) != num_collages:
+                print(f"Note: Created {len(image_batches)} collages (target was {num_collages}) for optimal coverage")
+            else:
+                print(f"Creating {num_collages} collage(s) with flexible sizing (±{args.split_tolerance}%)")
+        else:
+            # Standard fixed-size distribution
+            image_batches = optimize_image_distribution(images, num_collages)
+            print(f"Creating {num_collages} collage(s) with optimized image distribution")
     else:
         # Single collage with all images
         image_batches = [images]
