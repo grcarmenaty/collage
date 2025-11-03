@@ -564,10 +564,30 @@ class ImagePacker:
                                 valid_size_found = True
                                 break
 
-            # Last resort: keep original size if nothing else works
+            # Last resort: if no valid size found, clamp to allowed range while maintaining aspect ratio
+            # This ensures we stay within max_dimension_variation even if it causes minor overlap/fit issues
             if not valid_size_found:
-                packed.width = original_width
-                packed.height = original_height
+                # Try to get as close to average as possible while maintaining aspect ratio
+                if aspect_ratio >= 1:
+                    # Wider than tall - clamp width to allowed range
+                    clamped_width = max(min_width, min(original_width, max_width))
+                    clamped_height = int(clamped_width / aspect_ratio)
+                    # If height is out of range, adjust based on height instead
+                    if clamped_height < min_height or clamped_height > max_height:
+                        clamped_height = max(min_height, min(original_height, max_height))
+                        clamped_width = int(clamped_height * aspect_ratio)
+                    packed.width = max(1, clamped_width)
+                    packed.height = max(1, clamped_height)
+                else:
+                    # Taller than wide - clamp height to allowed range
+                    clamped_height = max(min_height, min(original_height, max_height))
+                    clamped_width = int(clamped_height * aspect_ratio)
+                    # If width is out of range, adjust based on width instead
+                    if clamped_width < min_width or clamped_width > max_width:
+                        clamped_width = max(min_width, min(original_width, max_width))
+                        clamped_height = int(clamped_width / aspect_ratio)
+                    packed.width = max(1, clamped_width)
+                    packed.height = max(1, clamped_height)
 
     def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
         """
