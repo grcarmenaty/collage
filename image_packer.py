@@ -504,13 +504,14 @@ class ImagePacker:
                     valid_size_found = True
                     break
 
-            # If no valid size found that respects overlaps, progressively try smaller areas
-            # But stay within the allowed area range
+            # If no valid size found that respects both uniformity and overlap,
+            # prioritize overlap constraints over uniformity - shrink as needed
             if not valid_size_found:
+                # First pass: try to stay within allowed area range
                 for area_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]:
                     test_area = avg_area * area_factor
 
-                    # Don't go below minimum allowed area
+                    # Stop if we go below minimum allowed area
                     if test_area < min_area:
                         break
 
@@ -524,20 +525,27 @@ class ImagePacker:
                             valid_size_found = True
                             break
 
-            # Last resort: clamp area to allowed range while maintaining aspect ratio
+            # Second pass: if still no valid size, aggressively shrink to eliminate overlaps
+            # Overlap constraints MUST be satisfied even if it violates size uniformity
             if not valid_size_found:
-                # Target the closest allowed area
-                if current_area > max_area:
-                    target_area = max_area
-                elif current_area < min_area:
-                    target_area = min_area
-                else:
-                    target_area = avg_area
+                # Start from min_area and shrink aggressively
+                for shrink_factor in [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]:
+                    test_area = min_area * shrink_factor
+                    test_width, test_height = dimensions_from_area(test_area, aspect_ratio)
 
-                # Calculate dimensions from target area
-                new_width, new_height = dimensions_from_area(target_area, aspect_ratio)
-                packed.width = new_width
-                packed.height = new_height
+                    if test_width <= available_width and test_height <= available_height:
+                        if self._check_space_available_with_overlap(packed.x, packed.y, test_width, test_height, i):
+                            packed.width = test_width
+                            packed.height = test_height
+                            valid_size_found = True
+                            break
+
+            # Last resort: if still no valid size (shouldn't happen), keep very small size
+            if not valid_size_found:
+                # Use minimal size that fits aspect ratio
+                test_width, test_height = dimensions_from_area(1, aspect_ratio)
+                packed.width = max(1, test_width)
+                packed.height = max(1, test_height)
 
     def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
         """
