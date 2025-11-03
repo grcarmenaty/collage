@@ -810,7 +810,7 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
         canvas_width: Canvas width for testing
         canvas_height: Canvas height for testing
         packer_params: Parameters for ImagePacker
-        no_repeats: If True, prevent images with same dimensions from being in same batch
+        no_repeats: If True, prevent images with same aspect ratio from being in same batch
 
     Returns:
         List of image batches optimized for maximum coverage
@@ -833,8 +833,8 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
     batches = []
     remaining_images = sorted_images.copy()
 
-    # Track dimensions across all batches if no_repeats is enabled
-    used_dimensions = set() if no_repeats else None
+    # Track aspect ratios across all batches if no_repeats is enabled
+    used_aspect_ratios = set() if no_repeats else None
 
     # Greedy algorithm: for each batch, try different image counts and pick the best coverage
     with tqdm(desc="Optimizing batch sizes", unit="batch", leave=False) as pbar:
@@ -847,14 +847,14 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
             for batch_size in range(min_per_batch, min(max_per_batch + 1, len(remaining_images) + 1)):
                 # Create test batch
                 if no_repeats:
-                    # Build batch while avoiding duplicate dimensions
+                    # Build batch while avoiding duplicate aspect ratios
                     test_batch = []
-                    batch_dims = set()
+                    batch_aspects = set()
                     for img in remaining_images:
-                        img_dims = (img.original_width, img.original_height)
-                        if img_dims not in batch_dims and img_dims not in used_dimensions:
+                        img_aspect = round(img.aspect_ratio, 3)
+                        if img_aspect not in batch_aspects and img_aspect not in used_aspect_ratios:
                             test_batch.append(img)
-                            batch_dims.add(img_dims)
+                            batch_aspects.add(img_aspect)
                             if len(test_batch) == batch_size:
                                 break
 
@@ -887,10 +887,10 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
                 batches.append(best_batch)
 
                 if no_repeats:
-                    # Track dimensions and remove used images
+                    # Track aspect ratios and remove used images
                     for img in best_batch:
-                        img_dims = (img.original_width, img.original_height)
-                        used_dimensions.add(img_dims)
+                        img_aspect = round(img.aspect_ratio, 3)
+                        used_aspect_ratios.add(img_aspect)
                     # Remove images in best_batch from remaining_images
                     remaining_images = [img for img in remaining_images if img not in best_batch]
                 else:
@@ -905,10 +905,10 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
                 batches.append(fallback_batch)
 
                 if no_repeats:
-                    # Track dimensions for fallback batch
+                    # Track aspect ratios for fallback batch
                     for img in fallback_batch:
-                        img_dims = (img.original_width, img.original_height)
-                        used_dimensions.add(img_dims)
+                        img_aspect = round(img.aspect_ratio, 3)
+                        used_aspect_ratios.add(img_aspect)
                     remaining_images = [img for img in remaining_images if img not in fallback_batch]
                 else:
                     remaining_images = remaining_images[batch_size:]
@@ -931,7 +931,7 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
     Args:
         images: List of images to distribute
         num_batches: Number of batches to create
-        no_repeats: If True, prevent images with same dimensions from being in same batch
+        no_repeats: If True, prevent images with same aspect ratio from being in same batch
 
     Returns:
         List of image batches optimized for packing
@@ -947,35 +947,36 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
     # Initialize batches
     batches = [[] for _ in range(num_batches)]
 
-    # Track dimensions in each batch if no_repeats is enabled
-    batch_dimensions = [set() for _ in range(num_batches)] if no_repeats else None
+    # Track aspect ratios in each batch if no_repeats is enabled
+    batch_aspect_ratios = [set() for _ in range(num_batches)] if no_repeats else None
 
     # Distribute images round-robin style, alternating between batches
     # This ensures each batch gets a mix of large and small images
     for idx, img in enumerate(sorted_by_size):
         if no_repeats:
-            # Find a batch that doesn't already have this dimension
-            img_dims = (img.original_width, img.original_height)
+            # Find a batch that doesn't already have this aspect ratio
+            # Round to 3 decimal places to handle floating point precision
+            img_aspect = round(img.aspect_ratio, 3)
             batch_idx = idx % num_batches
             attempts = 0
 
-            # Try round-robin assignment, avoiding batches with same dimensions
+            # Try round-robin assignment, avoiding batches with same aspect ratio
             while attempts < num_batches:
-                if img_dims not in batch_dimensions[batch_idx]:
+                if img_aspect not in batch_aspect_ratios[batch_idx]:
                     batches[batch_idx].append(img)
-                    batch_dimensions[batch_idx].add(img_dims)
+                    batch_aspect_ratios[batch_idx].add(img_aspect)
                     break
                 batch_idx = (batch_idx + 1) % num_batches
                 attempts += 1
 
-            # If we couldn't find a batch without this dimension, use the original assignment
-            # (this happens when there are more images of same size than batches)
+            # If we couldn't find a batch without this aspect ratio, use the original assignment
+            # (this happens when there are more images of same aspect ratio than batches)
             if attempts == num_batches:
                 batch_idx = idx % num_batches
                 batches[batch_idx].append(img)
-                batch_dimensions[batch_idx].add(img_dims)
-                if idx < len(sorted_by_size) // num_batches + 1:  # Only warn once per dimension
-                    tqdm.write(f"Warning: Cannot avoid repeat dimensions {img_dims} - more duplicates than batches")
+                batch_aspect_ratios[batch_idx].add(img_aspect)
+                if idx < len(sorted_by_size) // num_batches + 1:  # Only warn once per aspect ratio
+                    tqdm.write(f"Warning: Cannot avoid repeat aspect ratio {img_aspect:.3f} - more duplicates than batches")
         else:
             batch_idx = idx % num_batches
             batches[batch_idx].append(img)
@@ -1223,7 +1224,7 @@ def main():
     parser.add_argument(
         '--no-repeats',
         action='store_true',
-        help='Prevent images with the same dimensions from appearing in the same collage'
+        help='Prevent images with the same aspect ratio from appearing in the same collage'
     )
     parser.add_argument(
         '-n', '--images-per-collage',
