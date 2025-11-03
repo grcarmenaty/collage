@@ -18,6 +18,7 @@ from scipy.optimize import minimize
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from functools import partial
+import random
 
 
 @dataclass
@@ -56,13 +57,15 @@ class ImagePacker:
                  respect_original_size: bool = False,
                  max_size_variation: float = 15.0,
                  overlap_percent: float = 10.0,
-                 no_uniformity: bool = False):
+                 no_uniformity: bool = False,
+                 randomize: bool = False):
         self.canvas_width = canvas_width
         self.canvas_height = canvas_height
         self.respect_original_size = respect_original_size
         self.max_size_variation = max_size_variation / 100.0  # Convert to decimal
         self.overlap_percent = overlap_percent / 100.0  # Convert to decimal
         self.no_uniformity = no_uniformity
+        self.randomize = randomize
         self.free_rectangles: List[Rectangle] = [Rectangle(0, 0, canvas_width, canvas_height)]
         self.packed_images: List[PackedImage] = []
 
@@ -191,10 +194,14 @@ class ImagePacker:
         self.free_rectangles = [Rectangle(0, 0, self.canvas_width, self.canvas_height)]
         self.packed_images = []
 
-        # Sort images by area (largest first) for better packing
-        sorted_images = sorted(images,
-                             key=lambda img: img.original_width * img.original_height,
-                             reverse=True)
+        # Sort images by area (largest first) for better packing, unless randomize is enabled
+        if self.randomize:
+            sorted_images = images.copy()
+            random.shuffle(sorted_images)
+        else:
+            sorted_images = sorted(images,
+                                 key=lambda img: img.original_width * img.original_height,
+                                 reverse=True)
 
         # Calculate target area per image
         canvas_area = self.canvas_width * self.canvas_height
@@ -796,13 +803,13 @@ def process_single_collage(args_tuple):
     Args:
         args_tuple: Tuple of (batch_idx, batch, output_path, canvas_width, canvas_height,
                              respect_original_size, max_size_variation, overlap_percent,
-                             no_uniformity, bg_color)
+                             no_uniformity, randomize, bg_color)
 
     Returns:
         Dictionary with results and statistics
     """
     (batch_idx, batch, output_path, canvas_width, canvas_height,
-     respect_original_size, max_size_variation, overlap_percent, no_uniformity, bg_color) = args_tuple
+     respect_original_size, max_size_variation, overlap_percent, no_uniformity, randomize, bg_color) = args_tuple
 
     # Create a new packer instance for this batch
     packer = ImagePacker(
@@ -811,7 +818,8 @@ def process_single_collage(args_tuple):
         respect_original_size=respect_original_size,
         max_size_variation=max_size_variation,
         overlap_percent=overlap_percent,
-        no_uniformity=no_uniformity
+        no_uniformity=no_uniformity,
+        randomize=randomize
     )
 
     # Pack images
@@ -955,6 +963,11 @@ def main():
         help='Skip area uniformity enforcement to maximize coverage (images may vary more in size)'
     )
     parser.add_argument(
+        '--randomize',
+        action='store_true',
+        help='Randomize image order (default: sort by size for better packing)'
+    )
+    parser.add_argument(
         '-n', '--images-per-collage',
         type=int,
         help='Number of images per collage (creates multiple collages if needed)'
@@ -994,7 +1007,8 @@ def main():
         respect_original_size=args.respect_original_size,
         max_size_variation=args.max_size_variation,
         overlap_percent=args.overlap_percent,
-        no_uniformity=args.no_uniformity
+        no_uniformity=args.no_uniformity,
+        randomize=args.randomize
     )
 
     # Load images
@@ -1077,6 +1091,7 @@ def main():
                 args.max_size_variation,
                 args.overlap_percent,
                 args.no_uniformity,
+                args.randomize,
                 bg_color
             ))
 
