@@ -49,7 +49,7 @@ class ImagePacker:
 
     def __init__(self, canvas_width: int, canvas_height: int,
                  respect_original_size: bool = False,
-                 max_size_variation: float = 50.0,
+                 max_size_variation: float = 15.0,
                  overlap_percent: float = 10.0):
         self.canvas_width = canvas_width
         self.canvas_height = canvas_height
@@ -426,6 +426,61 @@ class ImagePacker:
             if not any_changes:
                 break
 
+    def enforce_size_uniformity(self, max_dimension_variation: float = 0.05):
+        """
+        Enforce strict size uniformity by ensuring no image dimension differs
+        by more than max_dimension_variation from the average.
+
+        Args:
+            max_dimension_variation: Maximum allowed variation (default 0.05 = 5%)
+        """
+        if not self.packed_images:
+            return
+
+        # Calculate average width and height
+        avg_width = sum(p.width for p in self.packed_images) / len(self.packed_images)
+        avg_height = sum(p.height for p in self.packed_images) / len(self.packed_images)
+
+        # Calculate allowed ranges
+        min_width = avg_width * (1 - max_dimension_variation)
+        max_width = avg_width * (1 + max_dimension_variation)
+        min_height = avg_height * (1 - max_dimension_variation)
+        max_height = avg_height * (1 + max_dimension_variation)
+
+        # Adjust each image to fit within the constraints
+        for packed in self.packed_images:
+            original_width = packed.width
+            original_height = packed.height
+            aspect_ratio = packed.info.aspect_ratio
+
+            # Check if width is out of bounds
+            if packed.width < min_width or packed.width > max_width:
+                # Clamp to allowed range
+                packed.width = max(min_width, min(packed.width, max_width))
+                # Adjust height to maintain aspect ratio
+                packed.height = int(packed.width / aspect_ratio)
+
+            # Check if height is out of bounds (or was affected by width adjustment)
+            if packed.height < min_height or packed.height > max_height:
+                # Clamp to allowed range
+                packed.height = max(min_height, min(packed.height, max_height))
+                # Adjust width to maintain aspect ratio
+                packed.width = int(packed.height * aspect_ratio)
+
+            # Final check: if we still violate constraints after aspect ratio adjustment,
+            # prioritize uniformity over perfect aspect ratio
+            if packed.width < min_width or packed.width > max_width:
+                packed.width = max(min_width, min(packed.width, max_width))
+
+            if packed.height < min_height or packed.height > max_height:
+                packed.height = max(min_height, min(packed.height, max_height))
+
+            # Ensure we stay within canvas bounds
+            if packed.x + packed.width > self.canvas_width:
+                packed.width = self.canvas_width - packed.x
+            if packed.y + packed.height > self.canvas_height:
+                packed.height = self.canvas_height - packed.y
+
     def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
         """
         Check if a rectangle at (x, y) with given dimensions is valid.
@@ -505,6 +560,8 @@ class ImagePacker:
         # This prioritizes space utilization over perfect size equality
         if not self.respect_original_size:
             self.grow_images_to_fill_space()
+            # Enforce strict size uniformity - no dimension should differ by more than 5% from average
+            self.enforce_size_uniformity(max_dimension_variation=0.05)
 
         return self.packed_images
 
@@ -564,8 +621,8 @@ def main():
     parser.add_argument(
         '--max-size-variation',
         type=float,
-        default=50.0,
-        help='Maximum percentage variation in image sizes (default: 50.0)'
+        default=15.0,
+        help='Maximum percentage variation in image sizes during growth (default: 15.0, final uniformity enforced at 5%%)'
     )
     parser.add_argument(
         '--overlap-percent',
@@ -634,6 +691,14 @@ def main():
     canvas_area = args.width * args.height
     coverage = (total_image_area / canvas_area) * 100
     print(f"Canvas coverage: {coverage:.1f}%")
+
+    # Print size uniformity statistics
+    if packed and not args.respect_original_size:
+        avg_width = sum(p.width for p in packed) / len(packed)
+        avg_height = sum(p.height for p in packed) / len(packed)
+        max_width_diff = max(abs(p.width - avg_width) / avg_width * 100 for p in packed)
+        max_height_diff = max(abs(p.height - avg_height) / avg_height * 100 for p in packed)
+        print(f"Size uniformity - Max width deviation: {max_width_diff:.2f}%, Max height deviation: {max_height_diff:.2f}%")
 
     return 0
 
