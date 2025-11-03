@@ -519,12 +519,22 @@ class ImagePacker:
                     break
 
             # If no valid size found that respects overlaps, progressively shrink
+            # But respect the max_dimension_variation constraint - don't shrink beyond the allowed range
             if not valid_size_found:
+                # Calculate the absolute minimum dimensions based on the variation constraint
+                absolute_min_width = max(1, int(avg_width * (1 - max_dimension_variation)))
+                absolute_min_height = max(1, int(avg_height * (1 - max_dimension_variation)))
+
                 # Start from the smallest allowed size and ensure it works
                 if aspect_ratio >= 1:
-                    # Wider than tall
-                    for shrink_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7]:
+                    # Wider than tall - try shrinking width within the allowed range
+                    # Generate shrink factors that stay within the constraint
+                    for shrink_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]:
                         test_width = int(min_width * shrink_factor)
+                        # Don't go below the absolute minimum (respects max_dimension_variation)
+                        if test_width < absolute_min_width:
+                            break
+
                         test_height = int(test_width / aspect_ratio)
                         test_width = max(1, test_width)
                         test_height = max(1, test_height)
@@ -536,9 +546,13 @@ class ImagePacker:
                                 valid_size_found = True
                                 break
                 else:
-                    # Taller than wide
-                    for shrink_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7]:
+                    # Taller than wide - try shrinking height within the allowed range
+                    for shrink_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]:
                         test_height = int(min_height * shrink_factor)
+                        # Don't go below the absolute minimum (respects max_dimension_variation)
+                        if test_height < absolute_min_height:
+                            break
+
                         test_width = int(test_height * aspect_ratio)
                         test_width = max(1, test_width)
                         test_height = max(1, test_height)
