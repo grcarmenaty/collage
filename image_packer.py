@@ -153,12 +153,19 @@ class ImagePacker:
             i += 1
 
     def calculate_scale_factor(self, images: List[ImageInfo]) -> float:
-        """Calculate the optimal scale factor to fit all images."""
+        """Calculate initial scale factor estimate for binary search."""
         total_area = sum(img.original_width * img.original_height for img in images)
         canvas_area = self.canvas_width * self.canvas_height
 
-        # Start with a scale based on area ratio
-        estimated_scale = math.sqrt(canvas_area / total_area) * 0.9
+        # Start with an optimistic scale - binary search will find the actual maximum
+        # For equal sizing mode, we target full canvas utilization
+        if not self.respect_original_size:
+            # Each image will be roughly canvas_area / len(images)
+            # So we need minimal scaling - use 1.0 as estimate
+            estimated_scale = 1.0
+        else:
+            # For proportional sizing, estimate based on total area
+            estimated_scale = math.sqrt(canvas_area / total_area)
 
         return estimated_scale
 
@@ -175,8 +182,8 @@ class ImagePacker:
         # Calculate target area per image for equal sizing (when not respecting original size)
         if not self.respect_original_size:
             canvas_area = self.canvas_width * self.canvas_height
-            # Assume 80% packing efficiency
-            target_area_per_image = (canvas_area * 0.8) / len(images)
+            # Start optimistic - binary search will find the actual maximum
+            target_area_per_image = (canvas_area * 1.0) / len(images)
 
         for img_info in sorted_images:
             if self.respect_original_size:
@@ -240,11 +247,12 @@ class ImagePacker:
 
         # Binary search for the best scale factor
         min_scale = 0.01
-        max_scale = self.calculate_scale_factor(images) * 2
+        max_scale = self.calculate_scale_factor(images) * 3  # More aggressive upper bound
         best_scale = min_scale
 
         # Try to find the largest scale that fits all images
-        for _ in range(20):  # Binary search iterations
+        # More iterations for better precision = better space utilization
+        for _ in range(30):
             mid_scale = (min_scale + max_scale) / 2
 
             if self.try_pack_with_scale(images, mid_scale):

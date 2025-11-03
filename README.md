@@ -1,14 +1,15 @@
 # Image Packer
 
-A Python tool that optimally packs multiple images into a single canvas with specified dimensions. The algorithm maximizes image sizes while minimizing whitespace, respecting original aspect ratios.
+A Python tool that optimally packs multiple images into a single canvas with specified dimensions. The algorithm **maximizes space occupation** by making images as large as possible while maintaining equal sizes and respecting original aspect ratios.
 
 ## Features
 
-- **Optimal Packing**: Uses a guillotine-based bin packing algorithm to efficiently arrange images
+- **Maximum Space Utilization**: Aggressively fills the canvas to maximize image sizes
+- **Optimal Packing**: Uses a guillotine-based bin packing algorithm with precise binary search
 - **Aspect Ratio Preservation**: All images maintain their original aspect ratios
 - **Equal Sizing**: By default, all images are scaled to roughly equal sizes for a uniform look
 - **Flexible Scaling Modes**:
-  - Default mode: Makes all images roughly equal in size
+  - Default mode: Makes all images roughly equal in size while maximizing total coverage
   - `--respect-original-size`: Maintains relative size differences between images
 - **Whitespace Minimization**: Intelligently arranges images to minimize gaps
 - **Multiple Format Support**: Supports JPG, PNG, BMP, GIF, TIFF, and WebP formats
@@ -72,12 +73,20 @@ Images are sorted by area (largest first) for better packing efficiency.
 
 1. The algorithm maintains a list of free rectangles representing available space
 2. **Scaling Mode**:
-   - **Default**: Calculates a target area per image and scales each image individually to achieve roughly equal sizes
+   - **Default**: Calculates a target area per image (canvas_area / num_images) and scales each image individually to achieve roughly equal sizes
    - **With `--respect-original-size`**: Applies uniform scaling to maintain relative size differences
-3. For each image, it finds the best-fitting free rectangle
+3. For each image, it finds the best-fitting free rectangle using a best-fit strategy
 4. After placing an image, it splits the used rectangle into new free rectangles
-5. Binary search is used to find the maximum scale adjustment factor that allows all images to fit
+5. **Binary search with 30 iterations** precisely finds the maximum scale factor that allows all images to fit, maximizing space occupation
 6. The final collage is rendered with all images at their optimized positions and sizes
+
+### Space Maximization
+
+The algorithm uses several techniques to maximize canvas utilization:
+- **Optimistic targeting**: Aims for 100% canvas coverage, letting binary search find the practical maximum
+- **Precise binary search**: 30 iterations ensure near-optimal scaling
+- **Aggressive upper bounds**: Explores up to 3x the estimated scale to find all possible solutions
+- **Best-fit placement**: Minimizes wasted space when placing each image
 
 ## Project Structure
 
