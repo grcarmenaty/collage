@@ -428,87 +428,73 @@ class ImagePacker:
 
     def enforce_size_uniformity(self, max_dimension_variation: float = 0.05):
         """
-        Enforce strict size uniformity by ensuring no image dimension differs
-        by more than max_dimension_variation from the average, while maintaining
-        aspect ratios and respecting overlap constraints.
+        Enforce strict size uniformity by ensuring all images have similar areas
+        while maintaining aspect ratios and respecting overlap constraints.
 
         Args:
-            max_dimension_variation: Maximum allowed variation (default 0.05 = 5%)
+            max_dimension_variation: Maximum allowed variation in area (default 0.05 = 5%)
         """
         if not self.packed_images:
             return
 
-        # Calculate average width and height
-        avg_width = sum(p.width for p in self.packed_images) / len(self.packed_images)
-        avg_height = sum(p.height for p in self.packed_images) / len(self.packed_images)
+        # Calculate average area (this is what we want to keep uniform)
+        avg_area = sum(p.width * p.height for p in self.packed_images) / len(self.packed_images)
 
-        # Calculate allowed ranges (ensure minimum of 1 pixel)
-        min_width = max(1, int(avg_width * (1 - max_dimension_variation)))
-        max_width = int(avg_width * (1 + max_dimension_variation))
-        min_height = max(1, int(avg_height * (1 - max_dimension_variation)))
-        max_height = int(avg_height * (1 + max_dimension_variation))
+        # Calculate allowed area range
+        min_area = max(1, avg_area * (1 - max_dimension_variation))
+        max_area = avg_area * (1 + max_dimension_variation)
 
-        # Adjust each image to fit within the constraints while maintaining aspect ratio
+        # Adjust each image to fit within the area constraints while maintaining aspect ratio
         for i, packed in enumerate(self.packed_images):
             aspect_ratio = packed.info.aspect_ratio
+            current_area = packed.width * packed.height
             original_width, original_height = packed.width, packed.height
 
             # Try different strategies to find a valid size
             valid_size_found = False
             candidate_sizes = []
 
-            # Strategy 1: Use width, calculate height from aspect ratio
-            clamped_width = max(min_width, min(packed.width, max_width))
-            height_for_width = int(clamped_width / aspect_ratio)
-            if min_height <= height_for_width <= max_height:
-                candidate_sizes.append((clamped_width, height_for_width))
+            # Helper function to calculate dimensions from area and aspect ratio
+            def dimensions_from_area(area, ar):
+                # area = width * height, aspect_ratio = width / height
+                # So: width = sqrt(area * aspect_ratio), height = sqrt(area / aspect_ratio)
+                width = int(math.sqrt(area * ar))
+                height = int(math.sqrt(area / ar))
+                return max(1, width), max(1, height)
 
-            # Strategy 2: Use height, calculate width from aspect ratio
-            clamped_height = max(min_height, min(packed.height, max_height))
-            width_for_height = int(clamped_height * aspect_ratio)
-            if min_width <= width_for_height <= max_width:
-                candidate_sizes.append((width_for_height, clamped_height))
+            # Strategy 1: Target average area
+            w, h = dimensions_from_area(avg_area, aspect_ratio)
+            candidate_sizes.append((w, h))
 
-            # Strategy 3: Use average dimensions as target
-            target_width = int(avg_width)
-            target_height = int(target_width / aspect_ratio)
-            if min_height <= target_height <= max_height:
-                candidate_sizes.append((target_width, target_height))
+            # Strategy 2: If currently too large, target max area
+            if current_area > max_area:
+                w, h = dimensions_from_area(max_area, aspect_ratio)
+                candidate_sizes.append((w, h))
 
-            # Strategy 4: Use average height as target
-            target_height = int(avg_height)
-            target_width = int(target_height * aspect_ratio)
-            if min_width <= target_width <= max_width:
-                candidate_sizes.append((target_width, target_height))
+            # Strategy 3: If currently too small, target min area
+            if current_area < min_area:
+                w, h = dimensions_from_area(min_area, aspect_ratio)
+                candidate_sizes.append((w, h))
 
-            # Strategy 5: Try scaling from min to max in the allowed range
-            # This handles edge cases where aspect ratio is difficult
-            if aspect_ratio >= 1:
-                # Wider than tall - try different widths
-                for width_candidate in [min_width, int(avg_width), max_width]:
-                    h = int(width_candidate / aspect_ratio)
-                    if min_height <= h <= max_height:
-                        candidate_sizes.append((width_candidate, h))
-            else:
-                # Taller than wide - try different heights
-                for height_candidate in [min_height, int(avg_height), max_height]:
-                    w = int(height_candidate * aspect_ratio)
-                    if min_width <= w <= max_width:
-                        candidate_sizes.append((w, height_candidate))
+            # Strategy 4: Try current dimensions if already in range
+            if min_area <= current_area <= max_area:
+                candidate_sizes.append((packed.width, packed.height))
 
             # Ensure we stay within canvas bounds
             available_width = self.canvas_width - packed.x
             available_height = self.canvas_height - packed.y
 
-            # Filter candidate sizes by canvas bounds
+            # Filter candidate sizes by canvas bounds and area range
             valid_candidates = []
             for w, h in candidate_sizes:
-                if w <= available_width and h <= available_height and w > 0 and h > 0:
+                area = w * h
+                if (w <= available_width and h <= available_height and
+                    w > 0 and h > 0 and min_area <= area <= max_area):
                     valid_candidates.append((w, h))
 
-            # Try each candidate size in order of preference (larger first)
-            # Sort by area descending
-            valid_candidates.sort(key=lambda x: x[0] * x[1], reverse=True)
+            # Try each candidate size in order of preference (prefer average area)
+            # Sort by distance from average area
+            valid_candidates.sort(key=lambda x: abs(x[0] * x[1] - avg_area))
 
             for new_width, new_height in valid_candidates:
                 # Check if this size respects overlap constraints
@@ -518,76 +504,40 @@ class ImagePacker:
                     valid_size_found = True
                     break
 
-            # If no valid size found that respects overlaps, progressively shrink
-            # But respect the max_dimension_variation constraint - don't shrink beyond the allowed range
+            # If no valid size found that respects overlaps, progressively try smaller areas
+            # But stay within the allowed area range
             if not valid_size_found:
-                # Calculate the absolute minimum dimensions based on the variation constraint
-                absolute_min_width = max(1, int(avg_width * (1 - max_dimension_variation)))
-                absolute_min_height = max(1, int(avg_height * (1 - max_dimension_variation)))
+                for area_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]:
+                    test_area = avg_area * area_factor
 
-                # Start from the smallest allowed size and ensure it works
-                if aspect_ratio >= 1:
-                    # Wider than tall - try shrinking width within the allowed range
-                    # Generate shrink factors that stay within the constraint
-                    for shrink_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]:
-                        test_width = int(min_width * shrink_factor)
-                        # Don't go below the absolute minimum (respects max_dimension_variation)
-                        if test_width < absolute_min_width:
+                    # Don't go below minimum allowed area
+                    if test_area < min_area:
+                        break
+
+                    # Calculate dimensions from area maintaining aspect ratio
+                    test_width, test_height = dimensions_from_area(test_area, aspect_ratio)
+
+                    if test_width <= available_width and test_height <= available_height:
+                        if self._check_space_available_with_overlap(packed.x, packed.y, test_width, test_height, i):
+                            packed.width = test_width
+                            packed.height = test_height
+                            valid_size_found = True
                             break
 
-                        test_height = int(test_width / aspect_ratio)
-                        test_width = max(1, test_width)
-                        test_height = max(1, test_height)
-
-                        if test_width <= available_width and test_height <= available_height:
-                            if self._check_space_available_with_overlap(packed.x, packed.y, test_width, test_height, i):
-                                packed.width = test_width
-                                packed.height = test_height
-                                valid_size_found = True
-                                break
-                else:
-                    # Taller than wide - try shrinking height within the allowed range
-                    for shrink_factor in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]:
-                        test_height = int(min_height * shrink_factor)
-                        # Don't go below the absolute minimum (respects max_dimension_variation)
-                        if test_height < absolute_min_height:
-                            break
-
-                        test_width = int(test_height * aspect_ratio)
-                        test_width = max(1, test_width)
-                        test_height = max(1, test_height)
-
-                        if test_width <= available_width and test_height <= available_height:
-                            if self._check_space_available_with_overlap(packed.x, packed.y, test_width, test_height, i):
-                                packed.width = test_width
-                                packed.height = test_height
-                                valid_size_found = True
-                                break
-
-            # Last resort: if no valid size found, clamp to allowed range while maintaining aspect ratio
-            # This ensures we stay within max_dimension_variation even if it causes minor overlap/fit issues
+            # Last resort: clamp area to allowed range while maintaining aspect ratio
             if not valid_size_found:
-                # Try to get as close to average as possible while maintaining aspect ratio
-                if aspect_ratio >= 1:
-                    # Wider than tall - clamp width to allowed range
-                    clamped_width = max(min_width, min(original_width, max_width))
-                    clamped_height = int(clamped_width / aspect_ratio)
-                    # If height is out of range, adjust based on height instead
-                    if clamped_height < min_height or clamped_height > max_height:
-                        clamped_height = max(min_height, min(original_height, max_height))
-                        clamped_width = int(clamped_height * aspect_ratio)
-                    packed.width = max(1, clamped_width)
-                    packed.height = max(1, clamped_height)
+                # Target the closest allowed area
+                if current_area > max_area:
+                    target_area = max_area
+                elif current_area < min_area:
+                    target_area = min_area
                 else:
-                    # Taller than wide - clamp height to allowed range
-                    clamped_height = max(min_height, min(original_height, max_height))
-                    clamped_width = int(clamped_height * aspect_ratio)
-                    # If width is out of range, adjust based on width instead
-                    if clamped_width < min_width or clamped_width > max_width:
-                        clamped_width = max(min_width, min(original_width, max_width))
-                        clamped_height = int(clamped_width / aspect_ratio)
-                    packed.width = max(1, clamped_width)
-                    packed.height = max(1, clamped_height)
+                    target_area = avg_area
+
+                # Calculate dimensions from target area
+                new_width, new_height = dimensions_from_area(target_area, aspect_ratio)
+                packed.width = new_width
+                packed.height = new_height
 
     def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
         """
