@@ -47,10 +47,15 @@ class Rectangle:
 class ImagePacker:
     """Packs images into a canvas using a guillotine-based algorithm."""
 
-    def __init__(self, canvas_width: int, canvas_height: int, respect_original_size: bool = False):
+    def __init__(self, canvas_width: int, canvas_height: int,
+                 respect_original_size: bool = False,
+                 max_size_variation: float = 10.0,
+                 overlap_percent: float = 5.0):
         self.canvas_width = canvas_width
         self.canvas_height = canvas_height
         self.respect_original_size = respect_original_size
+        self.max_size_variation = max_size_variation / 100.0  # Convert to decimal
+        self.overlap_percent = overlap_percent / 100.0  # Convert to decimal
         self.free_rectangles: List[Rectangle] = [Rectangle(0, 0, canvas_width, canvas_height)]
         self.packed_images: List[PackedImage] = []
 
@@ -242,98 +247,137 @@ class ImagePacker:
 
     def grow_images_to_fill_space(self):
         """
-        After initial packing, try to grow images to fill remaining whitespace.
-        Allows slight size variations to maximize space utilization.
+        After initial packing, aggressively grow images to fill remaining whitespace.
+        Allows size variations up to max_size_variation and overlaps up to overlap_percent.
         """
         if not self.packed_images:
             return
 
-        # Try to grow each image
-        for i, packed in enumerate(self.packed_images):
-            # Calculate how much we can grow in width and height
-            max_width_growth = 0
-            max_height_growth = 0
+        # Calculate average initial size for variation limits
+        avg_area = sum(p.width * p.height for p in self.packed_images) / len(self.packed_images)
+        avg_dimension = math.sqrt(avg_area)
 
-            # Check constraints from canvas boundaries
-            max_width_at_pos = self.canvas_width - packed.x
-            max_height_at_pos = self.canvas_height - packed.y
+        # Multiple aggressive growth passes
+        for growth_pass in range(3):
+            for i, packed in enumerate(self.packed_images):
+                current_area = packed.width * packed.height
 
-            # Check constraints from other images
-            for j, other in enumerate(self.packed_images):
-                if i == j:
+                # Calculate maximum allowed size based on variation
+                max_allowed_area = avg_area * (1 + self.max_size_variation)
+
+                # Stop growing this image if it's already at or above the max variation
+                if current_area >= max_allowed_area:
                     continue
 
-                # Check if other image is to the right
-                if (other.x >= packed.x + packed.width and
-                    other.y < packed.y + packed.height and
-                    other.y + other.height > packed.y):
-                    potential_width = other.x - packed.x
-                    max_width_at_pos = min(max_width_at_pos, potential_width)
+                aspect_ratio = packed.info.aspect_ratio
 
-                # Check if other image is below
-                if (other.y >= packed.y + packed.height and
-                    other.x < packed.x + packed.width and
-                    other.x + other.width > packed.x):
-                    potential_height = other.y - packed.y
-                    max_height_at_pos = min(max_height_at_pos, potential_height)
-
-            max_width_growth = max_width_at_pos - packed.width
-            max_height_growth = max_height_at_pos - packed.height
-
-            # Maintain aspect ratio while growing
-            aspect_ratio = packed.info.aspect_ratio
-
-            # Try different growth strategies
-            # Strategy 1: Grow width as much as possible while maintaining aspect ratio
-            if max_width_growth > 0:
-                new_width = packed.width + max_width_growth
+                # AGGRESSIVE STRATEGY 1: Maximum width growth with overlap allowed
+                max_width = self.canvas_width - packed.x
+                new_width = max_width
                 new_height = int(new_width / aspect_ratio)
-                if new_height <= packed.height + max_height_growth:
-                    # Check if this doesn't overlap with other images
-                    if self._check_space_available(packed.x, packed.y, new_width, new_height, i):
-                        packed.width = new_width
-                        packed.height = new_height
-                        continue
 
-            # Strategy 2: Grow height as much as possible while maintaining aspect ratio
-            if max_height_growth > 0:
-                new_height = packed.height + max_height_growth
+                # Check if within canvas and size variation limits
+                if new_height <= self.canvas_height - packed.y:
+                    new_area = new_width * new_height
+                    if new_area <= max_allowed_area:
+                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                            packed.width = new_width
+                            packed.height = new_height
+                            continue
+
+                # AGGRESSIVE STRATEGY 2: Maximum height growth with overlap allowed
+                max_height = self.canvas_height - packed.y
+                new_height = max_height
                 new_width = int(new_height * aspect_ratio)
-                if new_width <= packed.width + max_width_growth:
-                    # Check if this doesn't overlap with other images
-                    if self._check_space_available(packed.x, packed.y, new_width, new_height, i):
-                        packed.width = new_width
-                        packed.height = new_height
-                        continue
 
-            # Strategy 3: Grow proportionally to fill available space
-            if max_width_growth > 0 and max_height_growth > 0:
-                # Calculate scale factors for each dimension
-                width_scale = (packed.width + max_width_growth) / packed.width
-                height_scale = (packed.height + max_height_growth) / packed.height
+                if new_width <= self.canvas_width - packed.x:
+                    new_area = new_width * new_height
+                    if new_area <= max_allowed_area:
+                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                            packed.width = new_width
+                            packed.height = new_height
+                            continue
 
-                # Use the smaller scale to maintain aspect ratio
-                growth_scale = min(width_scale, height_scale)
+                # AGGRESSIVE STRATEGY 3: Grow to maximum allowed area
+                target_area = min(max_allowed_area, (self.canvas_width - packed.x) * (self.canvas_height - packed.y))
+                target_dimension = math.sqrt(target_area)
 
-                new_width = int(packed.width * growth_scale)
-                new_height = int(packed.height * growth_scale)
+                # Calculate dimensions based on aspect ratio
+                if aspect_ratio >= 1:
+                    new_height = int(target_dimension / math.sqrt(aspect_ratio))
+                    new_width = int(new_height * aspect_ratio)
+                else:
+                    new_width = int(target_dimension * math.sqrt(aspect_ratio))
+                    new_height = int(new_width / aspect_ratio)
 
-                if self._check_space_available(packed.x, packed.y, new_width, new_height, i):
+                # Make sure we fit in canvas
+                new_width = min(new_width, self.canvas_width - packed.x)
+                new_height = min(new_height, self.canvas_height - packed.y)
+
+                if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
                     packed.width = new_width
                     packed.height = new_height
+                    continue
 
-    def _check_space_available(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
-        """Check if a rectangle at (x, y) with given dimensions overlaps with any packed images."""
+                # AGGRESSIVE STRATEGY 4: Incremental growth with overlap
+                # Try to grow by 20% of remaining space each iteration
+                growth_factor = 1.2
+                new_width = int(packed.width * growth_factor)
+                new_height = int(packed.height * growth_factor)
+
+                # Constrain to canvas
+                new_width = min(new_width, self.canvas_width - packed.x)
+                new_height = min(new_height, self.canvas_height - packed.y)
+
+                new_area = new_width * new_height
+                if new_area <= max_allowed_area:
+                    if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                        packed.width = new_width
+                        packed.height = new_height
+
+    def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
+        """
+        Check if a rectangle at (x, y) with given dimensions is valid.
+        Allows overlaps up to overlap_percent of the smaller dimension.
+        """
         # Check canvas boundaries
         if x + width > self.canvas_width or y + height > self.canvas_height:
             return False
 
-        # Check overlap with other images
+        # Check overlap with other images - allow up to overlap_percent
         for i, other in enumerate(self.packed_images):
             if i == exclude_index:
                 continue
 
-            # Check for overlap
+            # Calculate overlap area
+            overlap_x = max(0, min(x + width, other.x + other.width) - max(x, other.x))
+            overlap_y = max(0, min(y + height, other.y + other.height) - max(y, other.y))
+
+            if overlap_x > 0 and overlap_y > 0:
+                # Calculate overlap as percentage of the smaller image
+                overlap_area = overlap_x * overlap_y
+                this_area = width * height
+                other_area = other.width * other.height
+                smaller_area = min(this_area, other_area)
+
+                # If overlap exceeds allowed percentage, reject
+                if overlap_area > smaller_area * self.overlap_percent:
+                    return False
+
+        return True
+
+    def _check_space_available(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
+        """Check if a rectangle at (x, y) with given dimensions overlaps with any packed images (no overlap allowed)."""
+        # Check canvas boundaries
+        if x + width > self.canvas_width or y + height > self.canvas_height:
+            return False
+
+        # Check overlap with other images - no overlap allowed
+        for i, other in enumerate(self.packed_images):
+            if i == exclude_index:
+                continue
+
+            # Check for any overlap
             if not (x + width <= other.x or
                     x >= other.x + other.width or
                     y + height <= other.y or
@@ -427,6 +471,18 @@ def main():
         help='Respect original image sizes and proportions (default: make all images roughly equal in size)'
     )
     parser.add_argument(
+        '--max-size-variation',
+        type=float,
+        default=10.0,
+        help='Maximum percentage variation in image sizes (default: 10.0)'
+    )
+    parser.add_argument(
+        '--overlap-percent',
+        type=float,
+        default=5.0,
+        help='Percentage of overlap allowed between images (default: 5.0)'
+    )
+    parser.add_argument(
         '--background-color',
         default='255,255,255',
         help='Background color as R,G,B (default: 255,255,255 for white)'
@@ -447,7 +503,9 @@ def main():
     packer = ImagePacker(
         args.width,
         args.height,
-        respect_original_size=args.respect_original_size
+        respect_original_size=args.respect_original_size,
+        max_size_variation=args.max_size_variation,
+        overlap_percent=args.overlap_percent
     )
 
     # Load images

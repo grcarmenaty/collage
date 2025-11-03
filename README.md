@@ -5,13 +5,15 @@ A Python tool that optimally packs multiple images into a single canvas with spe
 ## Features
 
 - **Maximum Space Utilization**: Aggressively fills the canvas to maximize image sizes
-- **Post-Packing Growth**: After initial packing, images are grown to fill remaining whitespace (allows slight size variations to eliminate gaps)
+- **Configurable Size Variation**: Allow up to 10% size variation by default (configurable) to eliminate whitespace
+- **Smart Overlap**: Permits 5% overlap between images by default (configurable) for better space utilization
+- **Aggressive Post-Packing Growth**: Multiple growth passes with 4 different strategies to fill remaining whitespace
 - **Optimal Packing**: Uses a guillotine-based bin packing algorithm with precise binary search
 - **Aspect Ratio Preservation**: All images maintain their original aspect ratios
 - **Equal Sizing**: By default, all images are scaled to roughly equal sizes for a uniform look
 - **Flexible Scaling Modes**:
-  - Default mode: Makes all images roughly equal in size, then grows them to fill whitespace (prioritizes space over perfect equality)
-  - `--respect-original-size`: Maintains relative size differences between images
+  - Default mode: Makes all images roughly equal in size, then aggressively grows them to fill whitespace (prioritizes space over perfect equality)
+  - `--respect-original-size`: Maintains relative size differences between images (no growth phase)
 - **Whitespace Minimization**: Intelligently arranges images to minimize gaps
 - **Multiple Format Support**: Supports JPG, PNG, BMP, GIF, TIFF, and WebP formats
 
@@ -41,6 +43,8 @@ This will read images from `input_images/` and save to `output_images/collage.pn
 - `-H`, `--height`: Height of output canvas in pixels (required)
 - `-o`, `--output`: Output file path (default: output_images/collage.png)
 - `--respect-original-size`: Maintain relative size differences between images (default: make all images roughly equal in size, then grow to fill whitespace)
+- `--max-size-variation`: Maximum percentage variation in image sizes (default: 10.0)
+- `--overlap-percent`: Percentage of overlap allowed between images (default: 5.0)
 - `--background-color`: Background color as R,G,B (default: 255,255,255 for white)
 
 ### Examples
@@ -66,6 +70,21 @@ Custom output path and background color:
 uv run image_packer.py -W 2560 -H 1440 -o my_collage.jpg --background-color 0,0,0
 ```
 
+Allow more size variation (20%) for even better space utilization:
+```bash
+uv run image_packer.py -W 1920 -H 1080 --max-size-variation 20
+```
+
+Allow more overlap (10%) for denser packing:
+```bash
+uv run image_packer.py -W 1920 -H 1080 --overlap-percent 10
+```
+
+No overlap, minimal size variation for stricter uniformity:
+```bash
+uv run image_packer.py -W 1920 -H 1080 --max-size-variation 5 --overlap-percent 0
+```
+
 ## Algorithm
 
 The tool uses a guillotine-based rectangle packing algorithm with the following approach:
@@ -87,7 +106,11 @@ Images are sorted by area (largest first) for better packing efficiency.
 3. For each image, it finds the best-fitting free rectangle using a best-fit strategy
 4. After placing an image, it splits the used rectangle into new free rectangles
 5. **Binary search with 30 iterations** precisely finds the maximum scale factor that allows all images to fit, maximizing space occupation
-6. **Post-packing growth** (default mode only): Each image is grown to fill adjacent whitespace while maintaining aspect ratio, allowing slight size variations to eliminate gaps
+6. **Aggressive post-packing growth** (default mode only): Multiple passes with 4 strategies to fill whitespace:
+   - **Strategy 1**: Maximize width growth (fill horizontally)
+   - **Strategy 2**: Maximize height growth (fill vertically)
+   - **Strategy 3**: Grow to maximum allowed area based on size variation limit
+   - **Strategy 4**: Incremental growth (20% per pass) with overlap allowance
 7. The final collage is rendered with all images at their optimized positions and sizes
 
 ### Space Maximization
@@ -97,7 +120,10 @@ The algorithm uses several techniques to maximize canvas utilization:
 - **Precise binary search**: 30 iterations ensure near-optimal scaling
 - **Aggressive upper bounds**: Explores up to 3x the estimated scale to find all possible solutions
 - **Best-fit placement**: Minimizes wasted space when placing each image
-- **Post-packing growth**: Images are expanded into remaining whitespace after initial packing (prioritizes space utilization over perfect size equality)
+- **Multi-pass aggressive growth**: 3 growth passes, each trying 4 different strategies
+- **Size variation allowance**: Permits up to 10% variation (configurable) from average size to fill gaps
+- **Smart overlap**: Allows up to 5% overlap (configurable) between images, calculated as percentage of smaller image
+- **Priority**: Space utilization > perfect size equality (configurable via flags)
 
 ## Project Structure
 
