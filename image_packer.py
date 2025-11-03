@@ -181,8 +181,13 @@ class ImagePacker:
 
         return estimated_scale
 
-    def try_pack_with_scale(self, images: List[ImageInfo], scale: float) -> bool:
-        """Try to pack all images with a given scale factor."""
+    def try_pack_with_target_areas(self, images: List[ImageInfo], area_scale: float = 1.0) -> bool:
+        """
+        Pack images where each has a target area of (canvas_area / n) * area_scale.
+
+        Args:
+            area_scale: Multiplier for target area (1.0 = perfect equal areas, <1.0 = smaller for safety)
+        """
         self.free_rectangles = [Rectangle(0, 0, self.canvas_width, self.canvas_height)]
         self.packed_images = []
 
@@ -191,43 +196,38 @@ class ImagePacker:
                              key=lambda img: img.original_width * img.original_height,
                              reverse=True)
 
-        # Calculate target area per image for equal sizing (when not respecting original size)
-        if not self.respect_original_size:
-            canvas_area = self.canvas_width * self.canvas_height
-            # Start optimistic - binary search will find the actual maximum
-            target_area_per_image = (canvas_area * 1.0) / len(images)
+        # Calculate target area per image
+        canvas_area = self.canvas_width * self.canvas_height
+        target_area_per_image = (canvas_area / len(images)) * area_scale
 
         for img_info in sorted_images:
             if self.respect_original_size:
-                # Use uniform scaling, respecting original size
+                # Use proportional sizing based on original areas
+                original_area = img_info.original_width * img_info.original_height
+                scale = math.sqrt(target_area_per_image / original_area)
                 scaled_width = int(img_info.original_width * scale)
                 scaled_height = int(img_info.original_height * scale)
-
                 # Do not exceed original dimensions
                 scaled_width = min(scaled_width, img_info.original_width)
                 scaled_height = min(scaled_height, img_info.original_height)
             else:
-                # Calculate individual scale to make images roughly equal in size
+                # Size each image to exactly target_area while respecting aspect ratio
                 original_area = img_info.original_width * img_info.original_height
+                aspect_ratio = img_info.aspect_ratio
 
-                # Scale to achieve target area
-                individual_scale = math.sqrt(target_area_per_image / original_area)
+                # Calculate dimensions for target area with this aspect ratio
+                # area = width * height, and width = height * aspect_ratio
+                # So: area = height^2 * aspect_ratio
+                # Therefore: height = sqrt(area / aspect_ratio)
+                height = math.sqrt(target_area_per_image / aspect_ratio)
+                width = height * aspect_ratio
 
-                # Apply global adjustment factor
-                individual_scale *= scale
-
-                scaled_width = int(img_info.original_width * individual_scale)
-                scaled_height = int(img_info.original_height * individual_scale)
+                scaled_width = int(width)
+                scaled_height = int(height)
 
             # Ensure minimum size
             scaled_width = max(1, scaled_width)
             scaled_height = max(1, scaled_height)
-
-            # OPTIMIZATION: Try to fit a larger version if space allows
-            if not self.respect_original_size:
-                scaled_width, scaled_height = self._optimize_image_size_for_space(
-                    img_info, scaled_width, scaled_height, target_area_per_image
-                )
 
             # Find a place to fit this image
             fit = self.find_best_fit(scaled_width, scaled_height)
@@ -714,49 +714,57 @@ class ImagePacker:
         return True
 
     def pack(self, images: List[ImageInfo]) -> List[PackedImage]:
-        """Pack all images into the canvas, finding the optimal scale."""
+        """
+        Pack all images into the canvas.
+
+        NEW APPROACH: Start with each image having area = canvas_area / n,
+        then iterate to find the best fit.
+        """
         if not images:
             return []
 
-        # Binary search for the best scale factor
-        min_scale = 0.01
-        max_scale = self.calculate_scale_factor(images) * 3  # More aggressive upper bound
-        best_scale = min_scale
+        # Start with target area = canvas_area / n images
+        # Use slightly less (95%) to account for packing inefficiency
+        area_scale = 0.95
+        best_scale = area_scale
 
-        # Try to find the largest scale that fits all images
-        # More iterations for better precision = better space utilization
-        with tqdm(total=30, desc="Finding optimal scale", unit="iter", leave=False) as pbar:
-            for _ in range(30):
-                mid_scale = (min_scale + max_scale) / 2
-
-                if self.try_pack_with_scale(images, mid_scale):
-                    best_scale = mid_scale
-                    min_scale = mid_scale
+        # Try progressively smaller sizes until packing succeeds
+        # This is much faster than binary search since we start close to optimal
+        with tqdm(total=10, desc="Finding optimal packing", unit="try", leave=False) as pbar:
+            for attempt in range(10):
+                if self.try_pack_with_target_areas(images, area_scale):
+                    best_scale = area_scale
+                    pbar.set_postfix({'coverage': f'{area_scale*100:.0f}%'})
+                    pbar.update(1)
+                    break
                 else:
-                    max_scale = mid_scale
-
-                pbar.set_postfix({'scale': f'{best_scale:.4f}'})
-                pbar.update(1)
+                    # Reduce target area by 5% and try again
+                    area_scale *= 0.95
+                    pbar.set_postfix({'trying': f'{area_scale*100:.0f}%'})
+                    pbar.update(1)
 
         # Pack with the best scale found
-        self.try_pack_with_scale(images, best_scale)
+        if not self.packed_images:
+            self.try_pack_with_target_areas(images, best_scale)
 
-        # Grow images to fill remaining whitespace (allows slight size variations)
-        # This prioritizes space utilization over perfect size equality
-        if not self.respect_original_size:
+        # Optionally grow images to fill remaining whitespace
+        # Since we start with equal areas, growth should be minimal
+        if not self.respect_original_size and not self.no_uniformity:
+            # Light growth pass to fill small gaps
             self.grow_images_to_fill_space()
 
-            # Only enforce area uniformity if explicitly enabled and we have enough overlap
-            # With 0% or very low overlap, we can't move images around to enforce uniformity
-            # without creating overlaps, which leads to optimizer failures
-            if self.no_uniformity:
-                print("Skipping area uniformity enforcement (--no-uniformity flag)")
-            elif self.overlap_percent < 0.05:  # Less than 5% overlap
-                print(f"Skipping area uniformity enforcement due to low overlap allowance ({self.overlap_percent*100:.0f}%)")
-                print(f"For area uniformity with low overlap, try increasing --overlap-percent to at least 5%")
+            # Enforce area uniformity if conditions allow
+            # With 0% or very low overlap, we can't adjust sizes without overlaps
+            if self.overlap_percent < 0.05:  # Less than 5% overlap
+                tqdm.write(f"Skipping area uniformity enforcement (overlap={self.overlap_percent*100:.0f}%)")
+                tqdm.write(f"Tip: Use --overlap-percent 5 for better uniformity, or --no-uniformity for max coverage")
             else:
-                # Enforce strict area uniformity using the user's max_size_variation parameter
+                # Since we started with equal areas, enforcement should converge quickly
                 self.enforce_area_uniformity(max_area_variation=self.max_size_variation)
+        elif self.no_uniformity and not self.respect_original_size:
+            # Maximum coverage mode - aggressive growth
+            self.grow_images_to_fill_space()
+            tqdm.write("Skipped area uniformity enforcement (--no-uniformity flag)")
 
         return self.packed_images
 
