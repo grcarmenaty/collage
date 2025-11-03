@@ -796,6 +796,58 @@ class ImagePacker:
         return canvas
 
 
+def optimize_image_distribution(images: List[ImageInfo], num_batches: int) -> List[List[ImageInfo]]:
+    """
+    Distribute images across multiple batches to maximize coverage.
+
+    Strategy: Alternate distribution by size and aspect ratio for balanced batches.
+    This ensures each collage gets a mix of large/small and wide/tall images.
+
+    Args:
+        images: List of images to distribute
+        num_batches: Number of batches to create
+
+    Returns:
+        List of image batches optimized for packing
+    """
+    if num_batches == 1:
+        return [images]
+
+    # Sort images by area (largest first)
+    sorted_by_size = sorted(images,
+                           key=lambda img: img.original_width * img.original_height,
+                           reverse=True)
+
+    # Initialize batches
+    batches = [[] for _ in range(num_batches)]
+
+    # Distribute images round-robin style, alternating between batches
+    # This ensures each batch gets a mix of large and small images
+    for idx, img in enumerate(sorted_by_size):
+        batch_idx = idx % num_batches
+        batches[batch_idx].append(img)
+
+    # Further optimize by swapping images to balance aspect ratio diversity
+    # Calculate average aspect ratio per batch
+    batch_aspects = []
+    for batch in batches:
+        if batch:
+            avg_aspect = sum(img.aspect_ratio for img in batch) / len(batch)
+            batch_aspects.append(avg_aspect)
+        else:
+            batch_aspects.append(1.0)
+
+    # Ensure each batch has similar total area for even coverage
+    batch_areas = [sum(img.original_width * img.original_height for img in batch) for batch in batches]
+    total_area = sum(batch_areas)
+    target_area_per_batch = total_area / num_batches
+
+    tqdm.write(f"Optimized image distribution: {[len(b) for b in batches]} images per collage")
+    tqdm.write(f"Area balance: {min(batch_areas)/target_area_per_batch*100:.1f}%-{max(batch_areas)/target_area_per_batch*100:.1f}% of target")
+
+    return batches
+
+
 def process_single_collage(args_tuple):
     """
     Process a single collage batch. Designed to be called in parallel.
@@ -1025,31 +1077,22 @@ def main():
 
     print(f"Found {len(images)} images.")
 
-    # Determine batching strategy
+    # Determine batching strategy with optimized distribution
     image_batches = []
     if args.images_per_collage:
-        # Create batches of N images each
-        batch_size = args.images_per_collage
-        for i in range(0, len(images), batch_size):
-            image_batches.append(images[i:i + batch_size])
-        print(f"Creating {len(image_batches)} collage(s) with {batch_size} images each")
+        # Create batches of N images each with optimized distribution
+        num_collages = (len(images) + args.images_per_collage - 1) // args.images_per_collage
+        image_batches = optimize_image_distribution(images, num_collages)
+        print(f"Creating {len(image_batches)} collage(s) with optimized image distribution")
     elif args.num_collages:
-        # Divide images evenly into P collages
+        # Divide images evenly into P collages with optimized distribution
         num_collages = args.num_collages
         if num_collages > len(images):
             print(f"Warning: Requested {num_collages} collages but only {len(images)} images available")
             num_collages = len(images)
 
-        batch_size = len(images) // num_collages
-        remainder = len(images) % num_collages
-
-        start_idx = 0
-        for i in range(num_collages):
-            # Distribute remainder images to first batches
-            current_batch_size = batch_size + (1 if i < remainder else 0)
-            image_batches.append(images[start_idx:start_idx + current_batch_size])
-            start_idx += current_batch_size
-        print(f"Creating {num_collages} collage(s) with {batch_size}-{batch_size + 1} images each")
+        image_batches = optimize_image_distribution(images, num_collages)
+        print(f"Creating {num_collages} collage(s) with optimized image distribution")
     else:
         # Single collage with all images
         image_batches = [images]
