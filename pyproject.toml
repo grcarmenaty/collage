@@ -3,9 +3,10 @@ name = "image-packer"
 version = "0.1.0"
 description = "Optimally pack multiple images into a single canvas with specified dimensions"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "Pillow>=10.0.0",
+    "scipy>=1.11.1",
 ]
 
 [project.scripts]
