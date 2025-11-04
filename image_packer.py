@@ -1366,9 +1366,10 @@ def optimize_canvas_count_for_coverage(images: List[ImageInfo], target_images_pe
     # Calculate ideal canvas count based on target
     ideal_canvases = max(1, round(total_images / target_images_per_canvas))
 
-    # Test a range around the ideal (50% fewer to 100% more canvases)
-    min_canvases = max(1, int(ideal_canvases * 0.5))
-    max_canvases = min(total_images, int(ideal_canvases * 2.0))
+    # Test a tight range around the ideal (80% to 120% of ideal)
+    # This is aggressive to stay close to target, especially important with --allow-repeats
+    min_canvases = max(1, int(ideal_canvases * 0.8))
+    max_canvases = min(total_images, int(ideal_canvases * 1.2))
 
     # Ensure reasonable bounds
     if max_canvases < min_canvases:
