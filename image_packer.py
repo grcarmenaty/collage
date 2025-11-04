@@ -905,7 +905,7 @@ def pre_distribute_forced_duplicates(images: List[ImageInfo], num_batches: int,
 def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_per_batch: int,
                                                tolerance_percent: float, canvas_width: int,
                                                canvas_height: int, packer_params: dict,
-                                               no_repeats_tolerance: float = 0) -> List[List[ImageInfo]]:
+                                               no_repeats_tolerance: float = 0, allow_repeats: bool = False) -> List[List[ImageInfo]]:
     """
     Distribute images with flexible batch sizes to maximize coverage.
 
@@ -917,6 +917,7 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
         canvas_height: Canvas height for testing
         packer_params: Parameters for ImagePacker
         no_repeats_tolerance: Tolerance percentage for aspect ratio matching (0 = disabled)
+        allow_repeats: If True, allow same image to appear in multiple batches (but not within same batch)
 
     Returns:
         List of image batches optimized for maximum coverage
@@ -924,7 +925,7 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
     if tolerance_percent <= 0:
         # No tolerance, use standard distribution
         num_batches = (len(images) + target_per_batch - 1) // target_per_batch
-        return optimize_image_distribution(images, num_batches, no_repeats_tolerance=no_repeats_tolerance)
+        return optimize_image_distribution(images, num_batches, no_repeats_tolerance=no_repeats_tolerance, allow_repeats=allow_repeats)
 
     # Calculate min/max images per batch
     tolerance = tolerance_percent / 100.0
@@ -1039,7 +1040,7 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
     return batches
 
 
-def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_repeats_tolerance: float = 0) -> List[List[ImageInfo]]:
+def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_repeats_tolerance: float = 0, allow_repeats: bool = False) -> List[List[ImageInfo]]:
     """
     Distribute images across multiple batches to maximize coverage.
 
@@ -1050,6 +1051,7 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
         images: List of images to distribute
         num_batches: Number of batches to create
         no_repeats_tolerance: Tolerance percentage for aspect ratio matching (0 = disabled)
+        allow_repeats: If True, allow same image to appear in multiple batches (but not within same batch)
 
     Returns:
         List of image batches optimized for packing
@@ -1057,21 +1059,32 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
     if num_batches == 1:
         return [images]
 
-    # Pre-distribute forced duplicates (images with same aspect ratio that exceed batch count)
-    batches, remaining_images, batch_aspect_counts = pre_distribute_forced_duplicates(
-        images, num_batches, no_repeats_tolerance
-    )
-
-    # If no pre-distribution happened, initialize from scratch
-    if batches is None:
+    # When allow_repeats is enabled, skip pre-distribution (we can reuse images across batches)
+    if allow_repeats:
         batches = [[] for _ in range(num_batches)]
         remaining_images = images
         batch_aspect_counts = None
+        tqdm.write(f"Using allow-repeats mode: images can appear in multiple canvases")
+    else:
+        # Pre-distribute forced duplicates (images with same aspect ratio that exceed batch count)
+        batches, remaining_images, batch_aspect_counts = pre_distribute_forced_duplicates(
+            images, num_batches, no_repeats_tolerance
+        )
 
-    # Sort remaining images by area (largest first)
-    sorted_by_size = sorted(remaining_images,
+        # If no pre-distribution happened, initialize from scratch
+        if batches is None:
+            batches = [[] for _ in range(num_batches)]
+            remaining_images = images
+            batch_aspect_counts = None
+
+    # Sort images by area (largest first) - use all images if allow_repeats
+    image_pool = images if allow_repeats else remaining_images
+    sorted_by_size = sorted(image_pool,
                            key=lambda img: img.original_width * img.original_height,
                            reverse=True)
+
+    # Track which images are in each batch (for allow_repeats)
+    batch_image_sets = [set() for _ in range(num_batches)] if allow_repeats else None
 
     # Track aspect ratios in each batch if no_repeats_tolerance is enabled
     if no_repeats_tolerance > 0:
@@ -1082,38 +1095,75 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
             # Also add aspect ratios from already allocated images in this batch
             for img in batch:
                 ar_set.add(img.aspect_ratio)
+                if batch_image_sets:
+                    batch_idx = batches.index(batch)
+                    batch_image_sets[batch_idx].add(id(img))
             batch_aspect_ratios.append(ar_set)
     else:
         batch_aspect_ratios = None
+        # Initialize image sets for allow_repeats even without no_repeats
+        if allow_repeats:
+            for batch_idx, batch in enumerate(batches):
+                for img in batch:
+                    batch_image_sets[batch_idx].add(id(img))
 
-    # Distribute remaining images round-robin style, alternating between batches
+    # Distribute images round-robin style, alternating between batches
     # This ensures each batch gets a mix of large and small images
-    for idx, img in enumerate(sorted_by_size):
-        if no_repeats_tolerance > 0:
-            # Find a batch that doesn't already have this aspect ratio (within tolerance)
-            img_aspect = img.aspect_ratio
-            batch_idx = idx % num_batches
-            attempts = 0
+    if allow_repeats:
+        # With allow_repeats, we can cycle through images multiple times
+        # Target images per batch (roughly equal distribution, but can exceed)
+        target_per_batch = len(images) // num_batches + 5  # Add buffer for better coverage
+        img_idx = 0
 
-            # Try round-robin assignment, avoiding batches with equivalent aspect ratios
-            while attempts < num_batches:
-                if not aspect_ratio_in_set(img_aspect, batch_aspect_ratios[batch_idx], no_repeats_tolerance):
+        while any(len(batch) < target_per_batch for batch in batches):
+            img = sorted_by_size[img_idx % len(sorted_by_size)]
+            batch_idx = img_idx % num_batches
+
+            # Check if this image is already in this batch
+            if id(img) not in batch_image_sets[batch_idx]:
+                # Check no_repeats constraint if enabled
+                if no_repeats_tolerance > 0:
+                    img_aspect = img.aspect_ratio
+                    if not aspect_ratio_in_set(img_aspect, batch_aspect_ratios[batch_idx], no_repeats_tolerance):
+                        batches[batch_idx].append(img)
+                        batch_image_sets[batch_idx].add(id(img))
+                        batch_aspect_ratios[batch_idx].add(img_aspect)
+                else:
                     batches[batch_idx].append(img)
-                    batch_aspect_ratios[batch_idx].add(img_aspect)
-                    break
-                batch_idx = (batch_idx + 1) % num_batches
-                attempts += 1
+                    batch_image_sets[batch_idx].add(id(img))
 
-            # HARD RULE: If we couldn't find a batch, create a new one
-            if attempts == num_batches:
-                # Create a new batch for this image
-                batches.append([img])
-                batch_aspect_ratios.append({img_aspect})
-                num_batches += 1
-                tqdm.write(f"Created additional batch to enforce --no-repeats constraint (aspect ratio {img_aspect:.3f})")
-        else:
-            batch_idx = idx % num_batches
-            batches[batch_idx].append(img)
+            img_idx += 1
+            # Prevent infinite loop
+            if img_idx > len(sorted_by_size) * num_batches * 3:
+                break
+    else:
+        # Without allow_repeats, distribute once
+        for idx, img in enumerate(sorted_by_size):
+            if no_repeats_tolerance > 0:
+                # Find a batch that doesn't already have this aspect ratio (within tolerance)
+                img_aspect = img.aspect_ratio
+                batch_idx = idx % num_batches
+                attempts = 0
+
+                # Try round-robin assignment, avoiding batches with equivalent aspect ratios
+                while attempts < num_batches:
+                    if not aspect_ratio_in_set(img_aspect, batch_aspect_ratios[batch_idx], no_repeats_tolerance):
+                        batches[batch_idx].append(img)
+                        batch_aspect_ratios[batch_idx].add(img_aspect)
+                        break
+                    batch_idx = (batch_idx + 1) % num_batches
+                    attempts += 1
+
+                # HARD RULE: If we couldn't find a batch, create a new one
+                if attempts == num_batches:
+                    # Create a new batch for this image
+                    batches.append([img])
+                    batch_aspect_ratios.append({img_aspect})
+                    num_batches += 1
+                    tqdm.write(f"Created additional batch to enforce --no-repeats constraint (aspect ratio {img_aspect:.3f})")
+            else:
+                batch_idx = idx % num_batches
+                batches[batch_idx].append(img)
 
     # Further optimize by swapping images to balance aspect ratio diversity
     # Calculate average aspect ratio per batch
@@ -1488,6 +1538,12 @@ def main():
              'Use 0 for exact matching (default: 0 = disabled)'
     )
     parser.add_argument(
+        '--allow-repeats',
+        action='store_true',
+        help='Allow the same image to appear in multiple canvases (but never twice in the same canvas). '
+             'Useful for maximizing coverage when you have fewer images than canvases.'
+    )
+    parser.add_argument(
         '-n', '--images-per-collage',
         type=int,
         help='Number of images per collage (creates multiple collages if needed)'
@@ -1593,13 +1649,13 @@ def main():
             }
             image_batches = optimize_image_distribution_with_tolerance(
                 images, args.images_per_collage, args.split_tolerance,
-                args.width, args.height, packer_params, no_repeats_tolerance=args.no_repeats
+                args.width, args.height, packer_params, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats
             )
             print(f"Creating {len(image_batches)} collage(s) with flexible sizing (±{args.split_tolerance}%)")
         else:
             # Standard fixed-size distribution
             num_collages = (len(images) + args.images_per_collage - 1) // args.images_per_collage
-            image_batches = optimize_image_distribution(images, num_collages, no_repeats_tolerance=args.no_repeats)
+            image_batches = optimize_image_distribution(images, num_collages, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats)
             print(f"Creating {len(image_batches)} collage(s) with optimized image distribution")
     elif args.num_collages:
         # Divide images evenly into P collages with optimized distribution
@@ -1620,7 +1676,7 @@ def main():
             }
             image_batches = optimize_image_distribution_with_tolerance(
                 images, target_per_collage, args.split_tolerance,
-                args.width, args.height, packer_params, no_repeats_tolerance=args.no_repeats
+                args.width, args.height, packer_params, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats
             )
             # Adjust if we created more/fewer batches than requested
             if len(image_batches) != num_collages:
@@ -1629,7 +1685,7 @@ def main():
                 print(f"Creating {num_collages} collage(s) with flexible sizing (±{args.split_tolerance}%)")
         else:
             # Standard fixed-size distribution
-            image_batches = optimize_image_distribution(images, num_collages, no_repeats_tolerance=args.no_repeats)
+            image_batches = optimize_image_distribution(images, num_collages, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats)
             print(f"Creating {num_collages} collage(s) with optimized image distribution")
     elif args.max_coverage:
         # Optimize canvas count for maximum coverage
@@ -1645,7 +1701,7 @@ def main():
         )
 
         # Use the optimal configuration
-        image_batches = optimize_image_distribution(images, optimal_canvases, no_repeats_tolerance=args.no_repeats)
+        image_batches = optimize_image_distribution(images, optimal_canvases, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats)
         print(f"Creating {len(image_batches)} collage(s) with optimized distribution for maximum coverage")
     else:
         # Single collage with all images
