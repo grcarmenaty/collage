@@ -1151,44 +1151,6 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
                 batches[batch_idx].append(img)
                 batch_image_sets[batch_idx].add(id(img))
 
-    # SECOND PASS: If allow_repeats, add images again to fill batches moderately
-    if allow_repeats:
-        tqdm.write(f"Base distribution complete: {[len(b) for b in batches]} images per canvas")
-
-        # Calculate a reasonable target: 1.5x average base distribution, capped at MAX_IMAGES_PER_BATCH
-        avg_base_count = sum(len(b) for b in batches) / num_batches
-        target_with_repeats = min(int(avg_base_count * 1.5), MAX_IMAGES_PER_BATCH)
-        tqdm.write(f"Adding repeats to fill batches (target ~{target_with_repeats} images per batch)...")
-
-        # Sort all images by area for filling
-        all_images_sorted = sorted(images,
-                                   key=lambda img: img.original_width * img.original_height,
-                                   reverse=True)
-
-        # Fill batches that are below the target
-        img_idx = 0
-        max_iterations = len(all_images_sorted) * num_batches * 2  # Safety limit
-        iterations = 0
-
-        while any(len(batch) < target_with_repeats for batch in batches) and iterations < max_iterations:
-            img = all_images_sorted[img_idx % len(all_images_sorted)]
-            batch_idx = img_idx % num_batches
-
-            # Only add if batch isn't full and image not already in this batch
-            if len(batches[batch_idx]) < MAX_IMAGES_PER_BATCH and id(img) not in batch_image_sets[batch_idx]:
-                # Check no_repeats constraint if enabled (same aspect ratio within batch)
-                if no_repeats_tolerance > 0:
-                    img_aspect = img.aspect_ratio
-                    if not aspect_ratio_in_set(img_aspect, batch_aspect_ratios[batch_idx], no_repeats_tolerance):
-                        batches[batch_idx].append(img)
-                        batch_image_sets[batch_idx].add(id(img))
-                        batch_aspect_ratios[batch_idx].add(img_aspect)
-                else:
-                    batches[batch_idx].append(img)
-                    batch_image_sets[batch_idx].add(id(img))
-
-            img_idx += 1
-            iterations += 1
 
     # Further optimize by swapping images to balance aspect ratio diversity
     # Calculate average aspect ratio per batch
@@ -1208,7 +1170,11 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
     tqdm.write(f"Optimized image distribution: {[len(b) for b in batches]} images per collage")
     tqdm.write(f"Area balance: {min(batch_areas)/target_area_per_batch*100:.1f}%-{max(batch_areas)/target_area_per_batch*100:.1f}% of target")
 
+    if allow_repeats:
+        tqdm.write(f"Note: Repeats will be added after packing to fill blank areas")
+
     return batches
+
 
 
 def process_single_collage(args_tuple):
@@ -1218,13 +1184,15 @@ def process_single_collage(args_tuple):
     Args:
         args_tuple: Tuple of (batch_idx, batch, output_path, canvas_width, canvas_height,
                              respect_original_size, max_size_variation, overlap_percent,
-                             no_uniformity, randomize, bg_color, save_to_file)
+                             no_uniformity, randomize, bg_color, save_to_file,
+                             allow_repeats, all_images, no_repeats_tolerance)
 
     Returns:
         Dictionary with results, statistics, and optionally the canvas
     """
     (batch_idx, batch, output_path, canvas_width, canvas_height,
-     respect_original_size, max_size_variation, overlap_percent, no_uniformity, randomize, bg_color, save_to_file) = args_tuple
+     respect_original_size, max_size_variation, overlap_percent, no_uniformity, randomize, bg_color,
+     save_to_file, allow_repeats, all_images, no_repeats_tolerance) = args_tuple
 
     # Create a new packer instance for this batch
     packer = ImagePacker(
@@ -1239,6 +1207,63 @@ def process_single_collage(args_tuple):
 
     # Pack images
     packed = packer.pack(batch)
+
+    # Aggressively fill blank areas with repeats if enabled
+    if allow_repeats and all_images:
+        initial_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
+
+        if initial_coverage < 95.0:  # Only try to fill if there's significant blank space
+            # Track which images are already used in this collage
+            used_image_ids = {id(img) for img in batch}
+
+            # Track aspect ratios if no_repeats_tolerance is enabled
+            if no_repeats_tolerance > 0:
+                used_aspects = {img.aspect_ratio for img in batch}
+
+            # Try to add more images aggressively
+            added_count = 0
+            max_attempts = len(all_images) * 2  # Try hard to fill
+
+            for attempt in range(max_attempts):
+                # Try images in order of size (largest first for better coverage)
+                for candidate in sorted(all_images,
+                                       key=lambda img: img.original_width * img.original_height,
+                                       reverse=True):
+                    # Skip if already used in this collage
+                    if id(candidate) in used_image_ids:
+                        continue
+
+                    # Check no_repeats constraint (aspect ratio)
+                    if no_repeats_tolerance > 0:
+                        if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
+                            continue
+
+                    # Check if we're at the safety limit
+                    if len(batch) + added_count >= MAX_IMAGES_PER_BATCH:
+                        break
+
+                    # Try to pack this image
+                    test_batch = batch + [candidate]
+                    test_packed = packer.pack(test_batch)
+
+                    # If it successfully packed (more images than before), accept it
+                    if len(test_packed) > len(packed):
+                        packed = test_packed
+                        batch = test_batch
+                        used_image_ids.add(id(candidate))
+                        if no_repeats_tolerance > 0:
+                            used_aspects.add(candidate.aspect_ratio)
+                        added_count += 1
+
+                # Check if we've achieved good coverage
+                current_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
+                if current_coverage >= 95.0 or added_count == 0:
+                    break
+
+            if added_count > 0:
+                final_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
+                tqdm.write(f"Collage {batch_idx}: Added {added_count} repeat images to fill blanks "
+                          f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
 
     # Create collage
     collage = packer.create_collage(background_color=bg_color)
@@ -1570,7 +1595,7 @@ def main():
         '--allow-repeats',
         action='store_true',
         help='Allow the same image to appear in multiple canvases (but never twice in the same canvas). '
-             'Useful for maximizing coverage when you have fewer images than canvases.'
+             'After initial packing, aggressively fills blank areas with repeated images to maximize coverage (target: 95%%).'
     )
     parser.add_argument(
         '-n', '--images-per-collage',
@@ -1779,7 +1804,10 @@ def main():
                 args.no_uniformity,
                 args.randomize,
                 bg_color,
-                not args.pdf  # save_to_file: False when creating PDF
+                not args.pdf,  # save_to_file: False when creating PDF
+                args.allow_repeats,  # allow_repeats
+                images,  # all_images: full image pool for repeat filling
+                args.no_repeats  # no_repeats_tolerance
             ))
 
         # Process in parallel with progress bar
@@ -1819,6 +1847,65 @@ def main():
             # Pack images
             print("Packing images...")
             packed = packer.pack(batch)
+
+            # Aggressively fill blank areas with repeats if enabled
+            if args.allow_repeats:
+                initial_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+
+                if initial_coverage < 95.0:  # Only try to fill if there's significant blank space
+                    print(f"Filling blank areas with repeats (initial coverage: {initial_coverage:.1f}%)...")
+
+                    # Track which images are already used in this collage
+                    used_image_ids = {id(img) for img in batch}
+
+                    # Track aspect ratios if no_repeats_tolerance is enabled
+                    if args.no_repeats > 0:
+                        used_aspects = {img.aspect_ratio for img in batch}
+
+                    # Try to add more images aggressively
+                    added_count = 0
+                    max_attempts = len(images) * 2  # Try hard to fill
+
+                    for attempt in range(max_attempts):
+                        # Try images in order of size (largest first for better coverage)
+                        for candidate in sorted(images,
+                                               key=lambda img: img.original_width * img.original_height,
+                                               reverse=True):
+                            # Skip if already used in this collage
+                            if id(candidate) in used_image_ids:
+                                continue
+
+                            # Check no_repeats constraint (aspect ratio)
+                            if args.no_repeats > 0:
+                                if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, args.no_repeats):
+                                    continue
+
+                            # Check if we're at the safety limit
+                            if len(batch) + added_count >= MAX_IMAGES_PER_BATCH:
+                                break
+
+                            # Try to pack this image
+                            test_batch = batch + [candidate]
+                            test_packed = packer.pack(test_batch)
+
+                            # If it successfully packed (more images than before), accept it
+                            if len(test_packed) > len(packed):
+                                packed = test_packed
+                                batch = test_batch
+                                used_image_ids.add(id(candidate))
+                                if args.no_repeats > 0:
+                                    used_aspects.add(candidate.aspect_ratio)
+                                added_count += 1
+
+                        # Check if we've achieved good coverage
+                        current_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+                        if current_coverage >= 95.0 or added_count == 0:
+                            break
+
+                    if added_count > 0:
+                        final_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+                        print(f"Added {added_count} repeat images to fill blanks "
+                              f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
 
             if not packed or len(packed) < len(batch):
                 print(f"Warning: Could only pack {len(packed)} out of {len(batch)} images.")
