@@ -1778,13 +1778,22 @@ def main():
             images, args.max_coverage, args.width, args.height, packer_params, args.no_repeats
         )
 
-        # Use the optimal configuration WITHOUT repeats (even if --allow-repeats is set)
-        # This ensures we hit the target images per canvas from the optimization
-        # If --allow-repeats is set, repeats will be added later to fill blanks
-        image_batches = optimize_image_distribution(images, optimal_canvases, no_repeats_tolerance=args.no_repeats, allow_repeats=False)
+        # Select base images for distribution: target_per_canvas * num_canvases
+        # Use optimal_per_canvas from the optimization (not all images)
+        target_total_images = optimal_canvases * args.max_coverage
+
+        # Select the best images for base distribution (largest first for better coverage)
+        base_images = sorted(images,
+                            key=lambda img: img.original_width * img.original_height,
+                            reverse=True)[:target_total_images]
+
+        print(f"Base distribution: {len(base_images)} images across {optimal_canvases} canvases (~{len(base_images)//optimal_canvases} per canvas)")
+
+        # Distribute ONLY the base images (not all images)
+        image_batches = optimize_image_distribution(base_images, optimal_canvases, no_repeats_tolerance=args.no_repeats, allow_repeats=False)
         print(f"Creating {len(image_batches)} collage(s) with optimized distribution for maximum coverage")
         if args.allow_repeats:
-            print(f"Note: Repeats will be added after collage creation to fill blank areas")
+            print(f"Note: Repeats will be added after collage creation to fill blank areas (from full pool of {len(images)} images)")
     else:
         # Single collage with all images
         image_batches = [images]
