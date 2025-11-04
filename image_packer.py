@@ -1341,18 +1341,18 @@ def save_canvases_to_pdf(canvases: List, output_path: str):
     print(f"\nPDF saved with {len(canvases)} page(s) to {output_path}")
 
 
-def optimize_canvas_count_for_coverage(images: List[ImageInfo], min_images_per_canvas: int,
+def optimize_canvas_count_for_coverage(images: List[ImageInfo], target_images_per_canvas: int,
                                        canvas_width: int, canvas_height: int,
                                        packer_params: dict, no_repeats_tolerance: float) -> tuple:
     """
     Determine optimal number of canvases to maximize average coverage.
 
-    Tests different canvas counts and images-per-canvas combinations,
+    Tests different canvas counts around a target images-per-canvas value,
     running quick packing tests to find the configuration with best coverage.
 
     Args:
         images: List of images to distribute
-        min_images_per_canvas: Minimum images per canvas
+        target_images_per_canvas: Target images per canvas (tests configurations around this)
         canvas_width: Canvas width
         canvas_height: Canvas height
         packer_params: Parameters for ImagePacker
@@ -1362,29 +1362,32 @@ def optimize_canvas_count_for_coverage(images: List[ImageInfo], min_images_per_c
         Tuple of (optimal_num_canvases, optimal_images_per_canvas, best_coverage)
     """
     total_images = len(images)
-    max_possible_canvases = total_images // min_images_per_canvas
 
-    if max_possible_canvases < 1:
-        # Not enough images, use single canvas with all images
-        return 1, total_images, 0.0
+    # Calculate ideal canvas count based on target
+    ideal_canvases = max(1, round(total_images / target_images_per_canvas))
+
+    # Test a range around the ideal (50% fewer to 100% more canvases)
+    min_canvases = max(1, int(ideal_canvases * 0.5))
+    max_canvases = min(total_images, int(ideal_canvases * 2.0))
+
+    # Ensure reasonable bounds
+    if max_canvases < min_canvases:
+        max_canvases = min_canvases
+
+    total_configs = max_canvases - min_canvases + 1
 
     print(f"\nOptimizing canvas count for maximum coverage...")
-    print(f"Testing configurations: {min_images_per_canvas}-{total_images} images per canvas")
-    print(f"Possible canvas counts: 1-{max_possible_canvases}")
+    print(f"Target: ~{target_images_per_canvas} images per canvas")
+    print(f"Ideal canvas count: {ideal_canvases} (testing range: {min_canvases}-{max_canvases})")
 
     best_config = None
     best_avg_coverage = 0
     results = []
 
     # Try different numbers of canvases
-    with tqdm(desc="Testing configurations", total=max_possible_canvases, unit="config") as pbar:
-        for num_canvases in range(1, max_possible_canvases + 1):
+    with tqdm(desc="Testing configurations", total=total_configs, unit="config") as pbar:
+        for num_canvases in range(min_canvases, max_canvases + 1):
             images_per_canvas = total_images // num_canvases
-
-            # Skip if images per canvas is below minimum
-            if images_per_canvas < min_images_per_canvas:
-                pbar.update(1)
-                continue
 
             # Distribute images for this configuration
             if no_repeats_tolerance > 0:
@@ -1562,10 +1565,10 @@ def main():
     parser.add_argument(
         '--max-coverage',
         type=int,
-        metavar='MIN_IMAGES',
+        metavar='TARGET_IMAGES',
         help='Automatically determine optimal number of canvases to maximize coverage. '
-             'Value is minimum images per canvas (e.g., 8 means at least 8 images per canvas). '
-             'Will try different canvas counts and pick the one with best average coverage.'
+             'Value is target images per canvas (e.g., 8 means aim for ~8 images per canvas). '
+             'Will test different canvas counts around this target and pick the one with best coverage.'
     )
     parser.add_argument(
         '-j', '--jobs',
@@ -1582,7 +1585,7 @@ def main():
         return 1
 
     if args.max_coverage and args.max_coverage < 1:
-        print("Error: --max-coverage minimum images must be at least 1")
+        print("Error: --max-coverage target images per canvas must be at least 1")
         return 1
 
     if args.split_tolerance < 0 or args.split_tolerance > 100:
