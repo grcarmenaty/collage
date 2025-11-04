@@ -1291,6 +1291,129 @@ def save_canvases_to_pdf(canvases: List, output_path: str):
     print(f"\nPDF saved with {len(canvases)} page(s) to {output_path}")
 
 
+def optimize_canvas_count_for_coverage(images: List[ImageInfo], min_images_per_canvas: int,
+                                       canvas_width: int, canvas_height: int,
+                                       packer_params: dict, no_repeats_tolerance: float) -> tuple:
+    """
+    Determine optimal number of canvases to maximize average coverage.
+
+    Tests different canvas counts and images-per-canvas combinations,
+    running quick packing tests to find the configuration with best coverage.
+
+    Args:
+        images: List of images to distribute
+        min_images_per_canvas: Minimum images per canvas
+        canvas_width: Canvas width
+        canvas_height: Canvas height
+        packer_params: Parameters for ImagePacker
+        no_repeats_tolerance: Tolerance for no-repeats constraint
+
+    Returns:
+        Tuple of (optimal_num_canvases, optimal_images_per_canvas, best_coverage)
+    """
+    total_images = len(images)
+    max_possible_canvases = total_images // min_images_per_canvas
+
+    if max_possible_canvases < 1:
+        # Not enough images, use single canvas with all images
+        return 1, total_images, 0.0
+
+    print(f"\nOptimizing canvas count for maximum coverage...")
+    print(f"Testing configurations: {min_images_per_canvas}-{total_images} images per canvas")
+    print(f"Possible canvas counts: 1-{max_possible_canvases}")
+
+    best_config = None
+    best_avg_coverage = 0
+    results = []
+
+    # Try different numbers of canvases
+    with tqdm(desc="Testing configurations", total=max_possible_canvases, unit="config") as pbar:
+        for num_canvases in range(1, max_possible_canvases + 1):
+            images_per_canvas = total_images // num_canvases
+
+            # Skip if images per canvas is below minimum
+            if images_per_canvas < min_images_per_canvas:
+                pbar.update(1)
+                continue
+
+            # Distribute images for this configuration
+            if no_repeats_tolerance > 0:
+                test_batches, _, _ = pre_distribute_forced_duplicates(images, num_canvases, no_repeats_tolerance)
+                if test_batches is None:
+                    test_batches = [[] for _ in range(num_canvases)]
+                # Simple round-robin for remaining to get quick estimate
+                remaining = [img for img in images if not any(img in batch for batch in test_batches)]
+                for idx, img in enumerate(remaining):
+                    test_batches[idx % num_canvases].append(img)
+            else:
+                # Simple round-robin distribution
+                test_batches = [[] for _ in range(num_canvases)]
+                for idx, img in enumerate(images):
+                    test_batches[idx % num_canvases].append(img)
+
+            # Quick packing test on each batch
+            coverages = []
+            for batch in test_batches:
+                if not batch:
+                    continue
+                test_packer = ImagePacker(canvas_width, canvas_height, **packer_params)
+                test_packer.pack(batch)
+
+                if test_packer.packed_images:
+                    total_area = sum(p.width * p.height for p in test_packer.packed_images)
+                    canvas_area = canvas_width * canvas_height
+                    coverage = (total_area / canvas_area) * 100
+                    coverages.append(coverage)
+
+            if coverages:
+                avg_coverage = sum(coverages) / len(coverages)
+                min_coverage = min(coverages)
+                max_coverage = max(coverages)
+
+                results.append({
+                    'num_canvases': num_canvases,
+                    'images_per_canvas': images_per_canvas,
+                    'avg_coverage': avg_coverage,
+                    'min_coverage': min_coverage,
+                    'max_coverage': max_coverage
+                })
+
+                if avg_coverage > best_avg_coverage:
+                    best_avg_coverage = avg_coverage
+                    best_config = (num_canvases, images_per_canvas)
+
+                pbar.set_postfix({
+                    'canvases': num_canvases,
+                    'per_canvas': images_per_canvas,
+                    'avg_cov': f'{avg_coverage:.1f}%'
+                })
+
+            pbar.update(1)
+
+    # Display results
+    print(f"\n{'='*80}")
+    print(f"Coverage optimization results:")
+    print(f"{'='*80}")
+    print(f"{'Canvases':<10} {'Images/Canvas':<15} {'Avg Coverage':<15} {'Min Coverage':<15} {'Max Coverage':<15}")
+    print(f"{'-'*80}")
+
+    for result in sorted(results, key=lambda x: x['avg_coverage'], reverse=True)[:10]:
+        marker = " <-- BEST" if (result['num_canvases'], result['images_per_canvas']) == best_config else ""
+        print(f"{result['num_canvases']:<10} {result['images_per_canvas']:<15} "
+              f"{result['avg_coverage']:<15.1f} {result['min_coverage']:<15.1f} "
+              f"{result['max_coverage']:<15.1f}{marker}")
+
+    if best_config:
+        print(f"{'='*80}")
+        print(f"Selected: {best_config[0]} canvases with ~{best_config[1]} images each")
+        print(f"Average coverage: {best_avg_coverage:.1f}%")
+        print(f"{'='*80}\n")
+        return best_config[0], best_config[1], best_avg_coverage
+    else:
+        # Fallback to single canvas
+        return 1, total_images, 0.0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Pack multiple images into a single canvas optimally.'
@@ -1381,6 +1504,14 @@ def main():
         help='Percentage flexibility in images per canvas to maximize coverage (e.g., 20 allows ±20%% from target)'
     )
     parser.add_argument(
+        '--max-coverage',
+        type=int,
+        metavar='MIN_IMAGES',
+        help='Automatically determine optimal number of canvases to maximize coverage. '
+             'Value is minimum images per canvas (e.g., 8 means at least 8 images per canvas). '
+             'Will try different canvas counts and pick the one with best average coverage.'
+    )
+    parser.add_argument(
         '-j', '--jobs',
         type=int,
         default=None,
@@ -1390,8 +1521,12 @@ def main():
     args = parser.parse_args()
 
     # Validate flags
-    if args.images_per_collage and args.num_collages:
-        print("Error: Cannot specify both -n/--images-per-collage and -p/--num-collages")
+    if sum([bool(args.images_per_collage), bool(args.num_collages), bool(args.max_coverage)]) > 1:
+        print("Error: Can only specify one of -n/--images-per-collage, -p/--num-collages, or --max-coverage")
+        return 1
+
+    if args.max_coverage and args.max_coverage < 1:
+        print("Error: --max-coverage minimum images must be at least 1")
         return 1
 
     if args.split_tolerance < 0 or args.split_tolerance > 100:
@@ -1496,6 +1631,22 @@ def main():
             # Standard fixed-size distribution
             image_batches = optimize_image_distribution(images, num_collages, no_repeats_tolerance=args.no_repeats)
             print(f"Creating {num_collages} collage(s) with optimized image distribution")
+    elif args.max_coverage:
+        # Optimize canvas count for maximum coverage
+        packer_params = {
+            'respect_original_size': args.respect_original_size,
+            'max_size_variation': args.max_size_variation,
+            'overlap_percent': args.overlap_percent,
+            'no_uniformity': args.no_uniformity,
+            'randomize': args.randomize
+        }
+        optimal_canvases, optimal_per_canvas, avg_coverage = optimize_canvas_count_for_coverage(
+            images, args.max_coverage, args.width, args.height, packer_params, args.no_repeats
+        )
+
+        # Use the optimal configuration
+        image_batches = optimize_image_distribution(images, optimal_canvases, no_repeats_tolerance=args.no_repeats)
+        print(f"Creating {len(image_batches)} collage(s) with optimized distribution for maximum coverage")
     else:
         # Single collage with all images
         image_batches = [images]
