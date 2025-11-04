@@ -1212,7 +1212,7 @@ def process_single_collage(args_tuple):
     if allow_repeats and all_images:
         initial_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
 
-        if initial_coverage < 95.0:  # Only try to fill if there's significant blank space
+        if initial_coverage < 90.0:  # Only try to fill if there's significant blank space (90% threshold)
             # Track which images are already used in this collage
             used_image_ids = {id(img) for img in batch}
 
@@ -1220,15 +1220,20 @@ def process_single_collage(args_tuple):
             if no_repeats_tolerance > 0:
                 used_aspects = {img.aspect_ratio for img in batch}
 
-            # Try to add more images aggressively
-            added_count = 0
-            max_attempts = len(all_images) * 2  # Try hard to fill
+            # Sort all images by size (largest first for better coverage)
+            candidates = sorted(all_images,
+                               key=lambda img: img.original_width * img.original_height,
+                               reverse=True)
 
-            for attempt in range(max_attempts):
-                # Try images in order of size (largest first for better coverage)
-                for candidate in sorted(all_images,
-                                       key=lambda img: img.original_width * img.original_height,
-                                       reverse=True):
+            # Keep trying to add images until we can't add any more
+            added_count = 0
+            consecutive_failures = 0
+            max_consecutive_failures = len(candidates)  # Stop after trying all images with no success
+
+            while consecutive_failures < max_consecutive_failures and len(batch) < MAX_IMAGES_PER_BATCH:
+                made_progress = False
+
+                for candidate in candidates:
                     # Skip if already used in this collage
                     if id(candidate) in used_image_ids:
                         continue
@@ -1239,12 +1244,21 @@ def process_single_collage(args_tuple):
                             continue
 
                     # Check if we're at the safety limit
-                    if len(batch) + added_count >= MAX_IMAGES_PER_BATCH:
+                    if len(batch) >= MAX_IMAGES_PER_BATCH:
                         break
 
-                    # Try to pack this image
+                    # Try to pack this image with a FRESH packer instance
                     test_batch = batch + [candidate]
-                    test_packed = packer.pack(test_batch)
+                    test_packer = ImagePacker(
+                        canvas_width,
+                        canvas_height,
+                        respect_original_size=respect_original_size,
+                        max_size_variation=max_size_variation,
+                        overlap_percent=overlap_percent,
+                        no_uniformity=no_uniformity,
+                        randomize=randomize
+                    )
+                    test_packed = test_packer.pack(test_batch)
 
                     # If it successfully packed (more images than before), accept it
                     if len(test_packed) > len(packed):
@@ -1254,16 +1268,26 @@ def process_single_collage(args_tuple):
                         if no_repeats_tolerance > 0:
                             used_aspects.add(candidate.aspect_ratio)
                         added_count += 1
+                        made_progress = True
+                        consecutive_failures = 0  # Reset failure counter
 
-                # Check if we've achieved good coverage
+                        # Update packer to use the successful pack
+                        packer = test_packer
+
+                # Check if we made any progress in this iteration
+                if not made_progress:
+                    consecutive_failures += 1
+
+                # Check if we've achieved excellent coverage
                 current_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
-                if current_coverage >= 95.0 or added_count == 0:
+                if current_coverage >= 90.0:
                     break
 
             if added_count > 0:
                 final_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
                 tqdm.write(f"Collage {batch_idx}: Added {added_count} repeat images to fill blanks "
                           f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
+
 
     # Create collage
     collage = packer.create_collage(background_color=bg_color)
@@ -1595,7 +1619,7 @@ def main():
         '--allow-repeats',
         action='store_true',
         help='Allow the same image to appear in multiple canvases (but never twice in the same canvas). '
-             'After initial packing, aggressively fills blank areas with repeated images to maximize coverage (target: 95%%).'
+             'After initial packing, aggressively fills blank areas with repeated images to maximize coverage (target: 90%%).'
     )
     parser.add_argument(
         '-n', '--images-per-collage',
@@ -1852,7 +1876,7 @@ def main():
             if args.allow_repeats:
                 initial_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
 
-                if initial_coverage < 95.0:  # Only try to fill if there's significant blank space
+                if initial_coverage < 90.0:  # Only try to fill if there's significant blank space (90% threshold)
                     print(f"Filling blank areas with repeats (initial coverage: {initial_coverage:.1f}%)...")
 
                     # Track which images are already used in this collage
@@ -1862,15 +1886,20 @@ def main():
                     if args.no_repeats > 0:
                         used_aspects = {img.aspect_ratio for img in batch}
 
-                    # Try to add more images aggressively
-                    added_count = 0
-                    max_attempts = len(images) * 2  # Try hard to fill
+                    # Sort all images by size (largest first for better coverage)
+                    candidates = sorted(images,
+                                       key=lambda img: img.original_width * img.original_height,
+                                       reverse=True)
 
-                    for attempt in range(max_attempts):
-                        # Try images in order of size (largest first for better coverage)
-                        for candidate in sorted(images,
-                                               key=lambda img: img.original_width * img.original_height,
-                                               reverse=True):
+                    # Keep trying to add images until we can't add any more
+                    added_count = 0
+                    consecutive_failures = 0
+                    max_consecutive_failures = len(candidates)  # Stop after trying all images with no success
+
+                    while consecutive_failures < max_consecutive_failures and len(batch) < MAX_IMAGES_PER_BATCH:
+                        made_progress = False
+
+                        for candidate in candidates:
                             # Skip if already used in this collage
                             if id(candidate) in used_image_ids:
                                 continue
@@ -1881,12 +1910,21 @@ def main():
                                     continue
 
                             # Check if we're at the safety limit
-                            if len(batch) + added_count >= MAX_IMAGES_PER_BATCH:
+                            if len(batch) >= MAX_IMAGES_PER_BATCH:
                                 break
 
-                            # Try to pack this image
+                            # Try to pack this image with a FRESH packer instance
                             test_batch = batch + [candidate]
-                            test_packed = packer.pack(test_batch)
+                            test_packer = ImagePacker(
+                                args.width,
+                                args.height,
+                                respect_original_size=args.respect_original_size,
+                                max_size_variation=args.max_size_variation,
+                                overlap_percent=args.overlap_percent,
+                                no_uniformity=args.no_uniformity,
+                                randomize=args.randomize
+                            )
+                            test_packed = test_packer.pack(test_batch)
 
                             # If it successfully packed (more images than before), accept it
                             if len(test_packed) > len(packed):
@@ -1896,16 +1934,26 @@ def main():
                                 if args.no_repeats > 0:
                                     used_aspects.add(candidate.aspect_ratio)
                                 added_count += 1
+                                made_progress = True
+                                consecutive_failures = 0  # Reset failure counter
 
-                        # Check if we've achieved good coverage
+                                # Update packer to use the successful pack
+                                packer = test_packer
+
+                        # Check if we made any progress in this iteration
+                        if not made_progress:
+                            consecutive_failures += 1
+
+                        # Check if we've achieved excellent coverage
                         current_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
-                        if current_coverage >= 95.0 or added_count == 0:
+                        if current_coverage >= 90.0:
                             break
 
                     if added_count > 0:
                         final_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
                         print(f"Added {added_count} repeat images to fill blanks "
                               f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
+
 
             if not packed or len(packed) < len(batch):
                 print(f"Warning: Could only pack {len(packed)} out of {len(batch)} images.")
