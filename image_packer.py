@@ -903,7 +903,8 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
                                 break
 
                     # If we couldn't get enough unique images, skip this batch size
-                    if len(test_batch) < min_per_batch:
+                    # But allow smaller batches to enforce the hard rule
+                    if len(test_batch) == 0:
                         continue
                 else:
                     test_batch = remaining_images[:batch_size]
@@ -943,21 +944,35 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
                 pbar.set_postfix({'images': len(best_batch), 'coverage': f'{best_coverage*100:.1f}%'})
                 pbar.update(1)
             else:
-                # Fallback: take minimum batch size
-                batch_size = min(min_per_batch, len(remaining_images))
-                fallback_batch = remaining_images[:batch_size]
-                batches.append(fallback_batch)
-
+                # Fallback: try to create a batch respecting the constraint even if smaller
                 if no_repeats_tolerance > 0:
-                    # Track aspect ratios for fallback batch
-                    for img in fallback_batch:
+                    # Build fallback batch while avoiding equivalent aspect ratios (HARD RULE)
+                    fallback_batch = []
+                    batch_aspects = set()
+                    for img in remaining_images:
                         img_aspect = img.aspect_ratio
-                        used_aspect_ratios.add(img_aspect)
-                    remaining_images = [img for img in remaining_images if img not in fallback_batch]
-                else:
-                    remaining_images = remaining_images[batch_size:]
+                        if not aspect_ratio_in_set(img_aspect, batch_aspects, no_repeats_tolerance) and \
+                           not aspect_ratio_in_set(img_aspect, used_aspect_ratios, no_repeats_tolerance):
+                            fallback_batch.append(img)
+                            batch_aspects.add(img_aspect)
 
-                pbar.update(1)
+                    if fallback_batch:
+                        batches.append(fallback_batch)
+                        for img in fallback_batch:
+                            used_aspect_ratios.add(img.aspect_ratio)
+                        remaining_images = [img for img in remaining_images if img not in fallback_batch]
+                        pbar.update(1)
+                    else:
+                        # No more images can be added without violating constraint
+                        tqdm.write(f"Warning: {len(remaining_images)} images remaining but cannot be distributed without violating --no-repeats constraint")
+                        break
+                else:
+                    # No constraint, just take minimum batch size
+                    batch_size = min(min_per_batch, len(remaining_images))
+                    fallback_batch = remaining_images[:batch_size]
+                    batches.append(fallback_batch)
+                    remaining_images = remaining_images[batch_size:]
+                    pbar.update(1)
 
     batch_sizes = [len(b) for b in batches]
     tqdm.write(f"Optimized distribution: {batch_sizes} images per canvas")
@@ -1012,14 +1027,13 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
                 batch_idx = (batch_idx + 1) % num_batches
                 attempts += 1
 
-            # If we couldn't find a batch without this aspect ratio, use the original assignment
-            # (this happens when there are more images of same aspect ratio than batches)
+            # HARD RULE: If we couldn't find a batch, create a new one
             if attempts == num_batches:
-                batch_idx = idx % num_batches
-                batches[batch_idx].append(img)
-                batch_aspect_ratios[batch_idx].add(img_aspect)
-                if idx < len(sorted_by_size) // num_batches + 1:  # Only warn once per aspect ratio
-                    tqdm.write(f"Warning: Cannot avoid repeat aspect ratio {img_aspect:.3f} (tolerance {no_repeats_tolerance}%) - more duplicates than batches")
+                # Create a new batch for this image
+                batches.append([img])
+                batch_aspect_ratios.append({img_aspect})
+                num_batches += 1
+                tqdm.write(f"Created additional batch to enforce --no-repeats constraint (aspect ratio {img_aspect:.3f})")
         else:
             batch_idx = idx % num_batches
             batches[batch_idx].append(img)
