@@ -51,7 +51,8 @@ class Rectangle:
 
 
 # Maximum images per batch to prevent memory crashes
-MAX_IMAGES_PER_BATCH = 150
+# Lower limit is critical for area uniformity optimization which uses O(n^2) constraints
+MAX_IMAGES_PER_BATCH = 50
 
 
 class ImagePacker:
@@ -480,6 +481,14 @@ class ImagePacker:
             return
 
         n = len(self.packed_images)
+
+        # Memory safety: skip uniformity for very large batches (O(n^2) constraints)
+        if n > MAX_IMAGES_PER_BATCH:
+            tqdm.write(f"⚠ Skipping area uniformity for {n} images (exceeds limit of {MAX_IMAGES_PER_BATCH})")
+            tqdm.write(f"   This batch has too many images for memory-safe optimization")
+            tqdm.write(f"   Use --no-uniformity flag or reduce images per canvas")
+            return
+
         max_iterations = 10  # Reduced from 50 for performance
 
         # For large numbers of images, optimization can be slow
@@ -1142,22 +1151,26 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
                 batches[batch_idx].append(img)
                 batch_image_sets[batch_idx].add(id(img))
 
-    # SECOND PASS: If allow_repeats, add images again to fill batches up to limit
+    # SECOND PASS: If allow_repeats, add images again to fill batches moderately
     if allow_repeats:
         tqdm.write(f"Base distribution complete: {[len(b) for b in batches]} images per canvas")
-        tqdm.write(f"Adding repeats to fill batches (max {MAX_IMAGES_PER_BATCH} images per batch)...")
+
+        # Calculate a reasonable target: 1.5x average base distribution, capped at MAX_IMAGES_PER_BATCH
+        avg_base_count = sum(len(b) for b in batches) / num_batches
+        target_with_repeats = min(int(avg_base_count * 1.5), MAX_IMAGES_PER_BATCH)
+        tqdm.write(f"Adding repeats to fill batches (target ~{target_with_repeats} images per batch)...")
 
         # Sort all images by area for filling
         all_images_sorted = sorted(images,
                                    key=lambda img: img.original_width * img.original_height,
                                    reverse=True)
 
-        # Fill batches that are below the limit
+        # Fill batches that are below the target
         img_idx = 0
         max_iterations = len(all_images_sorted) * num_batches * 2  # Safety limit
         iterations = 0
 
-        while any(len(batch) < MAX_IMAGES_PER_BATCH for batch in batches) and iterations < max_iterations:
+        while any(len(batch) < target_with_repeats for batch in batches) and iterations < max_iterations:
             img = all_images_sorted[img_idx % len(all_images_sorted)]
             batch_idx = img_idx % num_batches
 
@@ -1716,9 +1729,13 @@ def main():
             images, args.max_coverage, args.width, args.height, packer_params, args.no_repeats
         )
 
-        # Use the optimal configuration
-        image_batches = optimize_image_distribution(images, optimal_canvases, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats)
+        # Use the optimal configuration WITHOUT repeats (even if --allow-repeats is set)
+        # This ensures we hit the target images per canvas from the optimization
+        # If --allow-repeats is set, repeats will be added later to fill blanks
+        image_batches = optimize_image_distribution(images, optimal_canvases, no_repeats_tolerance=args.no_repeats, allow_repeats=False)
         print(f"Creating {len(image_batches)} collage(s) with optimized distribution for maximum coverage")
+        if args.allow_repeats:
+            print(f"Note: Repeats will be added after collage creation to fill blank areas")
     else:
         # Single collage with all images
         image_batches = [images]
