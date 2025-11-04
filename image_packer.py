@@ -1231,6 +1231,9 @@ def process_single_collage(args_tuple):
             max_consecutive_failures = len(candidates)  # Stop after trying all images with no success
 
             # Try to add images one at a time, checking coverage after each
+            # Only add images that meaningfully improve coverage (min 0.5% per image)
+            MIN_COVERAGE_IMPROVEMENT = 0.5  # percent
+
             for candidate in candidates:
                 # Stop if we've hit safety limit
                 if len(batch) >= MAX_IMAGES_PER_BATCH:
@@ -1263,17 +1266,22 @@ def process_single_collage(args_tuple):
                 )
                 test_packed = test_packer.pack(test_batch)
 
-                # If it successfully packed (more images than before), accept it
+                # Check if it packed successfully AND improves coverage meaningfully
                 if len(test_packed) > len(packed):
-                    packed = test_packed
-                    batch = test_batch
-                    used_image_ids.add(id(candidate))
-                    if no_repeats_tolerance > 0:
-                        used_aspects.add(candidate.aspect_ratio)
-                    added_count += 1
+                    new_coverage = sum(p.width * p.height for p in test_packed) / (canvas_width * canvas_height) * 100
+                    coverage_improvement = new_coverage - current_coverage
 
-                    # Update packer to use the successful pack
-                    packer = test_packer
+                    # Only accept if coverage improves by at least MIN_COVERAGE_IMPROVEMENT
+                    if coverage_improvement >= MIN_COVERAGE_IMPROVEMENT:
+                        packed = test_packed
+                        batch = test_batch
+                        used_image_ids.add(id(candidate))
+                        if no_repeats_tolerance > 0:
+                            used_aspects.add(candidate.aspect_ratio)
+                        added_count += 1
+
+                        # Update packer to use the successful pack
+                        packer = test_packer
 
             if added_count > 0:
                 final_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
@@ -1893,6 +1901,8 @@ def main():
                                        reverse=True)
 
                     # Try to add images one at a time, checking coverage after each
+                    # Only add images that meaningfully improve coverage (min 0.5% per image)
+                    MIN_COVERAGE_IMPROVEMENT = 0.5  # percent
                     added_count = 0
 
                     for candidate in candidates:
@@ -1927,17 +1937,22 @@ def main():
                         )
                         test_packed = test_packer.pack(test_batch)
 
-                        # If it successfully packed (more images than before), accept it
+                        # Check if it packed successfully AND improves coverage meaningfully
                         if len(test_packed) > len(packed):
-                            packed = test_packed
-                            batch = test_batch
-                            used_image_ids.add(id(candidate))
-                            if args.no_repeats > 0:
-                                used_aspects.add(candidate.aspect_ratio)
-                            added_count += 1
+                            new_coverage = sum(p.width * p.height for p in test_packed) / (args.width * args.height) * 100
+                            coverage_improvement = new_coverage - current_coverage
 
-                            # Update packer to use the successful pack
-                            packer = test_packer
+                            # Only accept if coverage improves by at least MIN_COVERAGE_IMPROVEMENT
+                            if coverage_improvement >= MIN_COVERAGE_IMPROVEMENT:
+                                packed = test_packed
+                                batch = test_batch
+                                used_image_ids.add(id(candidate))
+                                if args.no_repeats > 0:
+                                    used_aspects.add(candidate.aspect_ratio)
+                                added_count += 1
+
+                                # Update packer to use the successful pack
+                                packer = test_packer
 
                     if added_count > 0:
                         final_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
