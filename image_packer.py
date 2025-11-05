@@ -2147,8 +2147,26 @@ def main():
 
         # Print statistics for all collages
         results.sort(key=lambda x: x['batch_idx'])
+
+        # Check for single-image collages and flag them for retry
+        failed_batches = []
         for stats in results:
             print_collage_stats(stats, len(image_batches))
+            # Check if this resulted in a single-image collage
+            if stats['num_images'] >= 2 and stats['num_packed'] == 1:
+                failed_batches.append(stats['batch_idx'])
+                print(f"\n⚠ WARNING: Batch {stats['batch_idx']} would create single-image collage!")
+
+        # If any batches failed, suggest retry with sequential mode
+        if failed_batches:
+            print(f"\n{'='*60}")
+            print(f"⚠ RETRY NEEDED: {len(failed_batches)} batch(es) resulted in single-image collages")
+            print(f"Batches: {failed_batches}")
+            print(f"Suggestion: These batches need more images to pack successfully.")
+            print(f"Re-run with -j 1 to use sequential mode with automatic retry.")
+            print(f"{'='*60}")
+            # Don't save PDF if there are failures
+            return 1
 
         # If PDF mode, save all canvases to a single PDF
         if args.pdf:
@@ -2165,14 +2183,52 @@ def main():
             print(f"\nCreating {len(image_batches)} collages sequentially...")
 
         canvases = []  # For PDF mode
-        for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
+        batch_idx = 0
+        while batch_idx < len(image_batches):
+            batch = image_batches[batch_idx]
+            output_path = output_files[batch_idx]
+
             print(f"\n{'='*60}")
-            print(f"Collage {batch_idx}/{len(image_batches)}: {len(batch)} images -> {output_path}")
+            print(f"Collage {batch_idx+1}/{len(image_batches)}: {len(batch)} images -> {output_path}")
             print(f"{'='*60}")
 
             # Pack images
             print("Packing images...")
             packed = packer.pack(batch)
+
+            # CRITICAL: Check if packing failed to fit enough images
+            # If batch has 2+ images but only 1 packed, we need to retry with more images
+            if len(batch) >= 2 and len(packed) == 1:
+                print(f"\n⚠ WARNING: Only {len(packed)} out of {len(batch)} images fit on canvas!")
+                print(f"This would create a single-image collage, which is not allowed.")
+
+                # Try to merge with next batch and retry
+                if batch_idx < len(image_batches) - 1:
+                    print(f"Merging batch {batch_idx+1} with batch {batch_idx+2} and retrying...")
+                    # Merge current batch with next batch
+                    image_batches[batch_idx].extend(image_batches[batch_idx + 1])
+                    # Remove the next batch
+                    image_batches.pop(batch_idx + 1)
+                    output_files.pop(batch_idx + 1)
+                    # Retry this batch (don't increment batch_idx)
+                    print(f"Retry: Batch now has {len(image_batches[batch_idx])} images")
+                    continue
+                else:
+                    # Last batch - try to merge with previous
+                    if batch_idx > 0:
+                        print(f"Merging batch {batch_idx+1} with batch {batch_idx} and retrying...")
+                        # Merge with previous batch
+                        image_batches[batch_idx - 1].extend(image_batches[batch_idx])
+                        # Remove current batch
+                        image_batches.pop(batch_idx)
+                        output_files.pop(batch_idx)
+                        # Go back and retry the previous batch
+                        batch_idx -= 1
+                        print(f"Retry: Batch {batch_idx+1} now has {len(image_batches[batch_idx])} images")
+                        continue
+                    else:
+                        print(f"ERROR: Cannot merge - this is the only batch!")
+                        print(f"Try increasing canvas size with -W and -H")
 
             # Aggressively fill blank areas with repeats if enabled
             if args.allow_repeats:
@@ -2274,6 +2330,9 @@ def main():
                             overlap_percent = (overlap_area / p_area) * 100
                             max_overlap_percent = max(max_overlap_percent, overlap_percent)
                 print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
+
+            # Move to next batch
+            batch_idx += 1
 
         # If PDF mode in sequential processing, save all canvases to a single PDF
         if args.pdf and canvases:
