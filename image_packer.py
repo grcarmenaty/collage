@@ -853,11 +853,7 @@ class ImagePacker:
         canvas_area = self.canvas_width * self.canvas_height
         max_iterations = 100  # Increased limit for aggressive filling
 
-        # CRITICAL: Rebuild free rectangles from actual canvas state
-        # The guillotine algorithm's tracked rectangles may be inaccurate after growth/overlap
         tqdm.write(f"Starting aggressive gap-filling to achieve {target_coverage:.1f}% coverage...")
-        tqdm.write(f"Scanning canvas to find all free space...")
-        self.rebuild_free_rectangles_from_canvas()
 
         # Keep trying to add images until we can't add any more or reach target
         with tqdm(total=max_iterations, desc="Filling gaps with repeats", unit="pass", leave=False) as pbar:
@@ -875,146 +871,106 @@ class ImagePacker:
                 # Track images added in this iteration
                 iteration_added = 0
 
-                # Rebuild free rectangles every few iterations to catch newly exposed gaps
-                # After placing images, we split rectangles, but might miss larger contiguous areas
-                if iteration > 0 and iteration % 5 == 0:
-                    self.rebuild_free_rectangles_from_canvas()
+                # Rebuild free rectangles every iteration to catch newly exposed gaps
+                # This is critical for finding big gaps after placing images
+                self.rebuild_free_rectangles_from_canvas()
 
-                # Sort free rectangles by area (largest first) to fill big gaps first
-                sorted_rects = sorted(self.free_rectangles,
-                                     key=lambda r: r.width * r.height,
-                                     reverse=True)
+                # If no gaps remain, we're done
+                if not self.free_rectangles:
+                    pbar.write(f"No more gaps to fill")
+                    break
 
-                # Try to fill EVERY free rectangle, no matter how small
-                for free_rect in sorted_rects:
-                    # Check coverage again
-                    current_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
-                    if current_coverage >= target_coverage:
-                        break
+                # NEW STRATEGY: Place ONE image per iteration, as LARGE as possible
+                # Try multiple positions from largest gaps and choose best
+                best_placement = None
+                best_coverage = 0
 
-                    rect_area = free_rect.width * free_rect.height
+                # Try top 3 largest gaps as potential placement positions
+                test_positions = sorted(self.free_rectangles,
+                                       key=lambda r: r.width * r.height,
+                                       reverse=True)[:3]
 
-                    # NO MINIMUM SIZE CONSTRAINT - fill even 1-pixel rectangles if needed
-                    # Only skip truly unusable rectangles (less than 1 pixel)
-                    if rect_area < 1:
+                # PASS 1: Try unused images first (diversity)
+                for candidate in candidate_images:
+                    # Skip if already used
+                    if id(candidate) in used_image_ids:
                         continue
 
-                    # TWO-PASS APPROACH: Try unused images first, then used images
-                    # This ensures big gaps get filled with fresh images before repeating
-                    best_candidate = None
-                    best_fit_area = 0
-
-                    # PASS 1: Try UNUSED images first (prioritize filling with new images)
-                    for candidate in candidate_images:
-                        # Skip if already used - we want fresh images first
-                        if id(candidate) in used_image_ids:
+                    # Check aspect ratio constraint
+                    if used_aspects is not None and no_repeats_tolerance > 0:
+                        if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
                             continue
 
-                        # Check aspect ratio constraint if specified
+                    # Try placing at each test position, maximize size
+                    for gap in test_positions:
+                        aspect = candidate.aspect_ratio
+
+                        # Try to make image as LARGE as possible
+                        # Start with largest dimension that fits the gap
+                        if gap.width / gap.height > aspect:
+                            test_height = gap.height
+                            test_width = int(test_height * aspect)
+                        else:
+                            test_width = gap.width
+                            test_height = int(test_width / aspect)
+
+                        # Ensure minimum size
+                        if test_width < 1 or test_height < 1:
+                            continue
+
+                        # Check if valid (no excessive overlaps)
+                        if self._check_space_available_with_overlap(
+                            gap.x, gap.y, test_width, test_height, -1
+                        ):
+                            coverage = test_width * test_height
+                            if coverage > best_coverage:
+                                best_coverage = coverage
+                                best_placement = (candidate, gap.x, gap.y, test_width, test_height, False)
+
+                # PASS 2: If no unused image works, try repeats
+                if not best_placement:
+                    for candidate in candidate_images:
+                        # Check aspect ratio constraint
                         if used_aspects is not None and no_repeats_tolerance > 0:
                             if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
                                 continue
 
-                        # Calculate how large we can make this image in this rectangle
-                        aspect = candidate.aspect_ratio
-
-                        # Try to fill the rectangle while maintaining aspect ratio
-                        if free_rect.width / free_rect.height > aspect:
-                            # Rectangle is wider than image - constrain by height
-                            fit_height = free_rect.height
-                            fit_width = int(fit_height * aspect)
-                        else:
-                            # Rectangle is taller than image - constrain by width
-                            fit_width = free_rect.width
-                            fit_height = int(fit_width / aspect)
-
-                        # Ensure it fits
-                        if fit_width > free_rect.width or fit_height > free_rect.height:
-                            continue
-
-                        # NO MINIMUM SIZE - scale down as much as needed!
-                        if fit_width < 1 or fit_height < 1:
-                            continue
-
-                        fit_area = fit_width * fit_height
-
-                        # Check if this placement is valid (no excessive overlaps)
-                        if self._check_space_available_with_overlap(
-                            free_rect.x, free_rect.y, fit_width, fit_height, -1
-                        ):
-                            # Prefer images that fill more of the rectangle
-                            if fit_area > best_fit_area:
-                                best_fit_area = fit_area
-                                best_candidate = (candidate, fit_width, fit_height, False)  # False = not a repeat
-
-                    # PASS 2: If no unused image fits, try USED images (allow repeats)
-                    if not best_candidate:
-                        for candidate in candidate_images:
-                            # Now we allow already-used images
-                            # Still check aspect ratio constraint
-                            if used_aspects is not None and no_repeats_tolerance > 0:
-                                if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
-                                    continue
-
-                            # Calculate how large we can make this image in this rectangle
+                        # Try placing at each test position
+                        for gap in test_positions:
                             aspect = candidate.aspect_ratio
 
-                            # Try to fill the rectangle while maintaining aspect ratio
-                            if free_rect.width / free_rect.height > aspect:
-                                fit_height = free_rect.height
-                                fit_width = int(fit_height * aspect)
+                            if gap.width / gap.height > aspect:
+                                test_height = gap.height
+                                test_width = int(test_height * aspect)
                             else:
-                                fit_width = free_rect.width
-                                fit_height = int(fit_width / aspect)
+                                test_width = gap.width
+                                test_height = int(test_width / aspect)
 
-                            # Ensure it fits
-                            if fit_width > free_rect.width or fit_height > free_rect.height:
+                            if test_width < 1 or test_height < 1:
                                 continue
 
-                            if fit_width < 1 or fit_height < 1:
-                                continue
-
-                            fit_area = fit_width * fit_height
-
-                            # Check if this placement is valid
                             if self._check_space_available_with_overlap(
-                                free_rect.x, free_rect.y, fit_width, fit_height, -1
+                                gap.x, gap.y, test_width, test_height, -1
                             ):
-                                if fit_area > best_fit_area:
-                                    best_fit_area = fit_area
-                                    best_candidate = (candidate, fit_width, fit_height, True)  # True = is a repeat
+                                coverage = test_width * test_height
+                                if coverage > best_coverage:
+                                    best_coverage = coverage
+                                    best_placement = (candidate, gap.x, gap.y, test_width, test_height, True)
 
-                    # Place the best candidate if found
-                    if best_candidate:
-                        candidate, fit_width, fit_height, is_repeat = best_candidate
+                # Place the best image found
+                if best_placement:
+                    candidate, x, y, width, height, is_repeat = best_placement
 
-                        # Add the image
-                        self.packed_images.append(PackedImage(
-                            info=candidate,
-                            x=free_rect.x,
-                            y=free_rect.y,
-                            width=fit_width,
-                            height=fit_height
-                        ))
+                    self.packed_images.append(PackedImage(
+                        info=candidate,
+                        x=x,
+                        y=y,
+                        width=width,
+                        height=height
+                    ))
 
-                        # Track usage (even for repeats, to know what we've used)
-                        used_image_ids.add(id(candidate))
-
-                        iteration_added += 1
-
-                        # Update free rectangles
-                        # Remove the used rectangle and add splits
-                        if free_rect in self.free_rectangles:
-                            self.free_rectangles.remove(free_rect)
-
-                        new_rects = self.split_rectangle(free_rect, fit_width, fit_height)
-                        self.free_rectangles.extend(new_rects)
-                        self.remove_redundant_rectangles()
-
-                        # Re-sort for next rectangle
-                        sorted_rects = sorted(self.free_rectangles,
-                                             key=lambda r: r.width * r.height,
-                                             reverse=True)
+                    used_image_ids.add(id(candidate))
+                    iteration_added = 1
 
                 total_added += iteration_added
                 pbar.update(1)
@@ -1522,6 +1478,10 @@ def process_single_collage(args_tuple):
             candidates = sorted(all_images,
                                key=lambda img: img.original_width * img.original_height,
                                reverse=True)
+
+            # CRITICAL: Rebuild free rectangles before gap-filling to find ALL gaps
+            tqdm.write(f"Collage {batch_idx}: Scanning canvas to detect all gaps...")
+            packer.rebuild_free_rectangles_from_canvas()
 
             # Use the new direct gap-filling method
             added_count = packer.fill_gaps_with_repeats(
@@ -2171,6 +2131,10 @@ def main():
                     candidates = sorted(images,
                                        key=lambda img: img.original_width * img.original_height,
                                        reverse=True)
+
+                    # CRITICAL: Rebuild free rectangles before gap-filling to find ALL gaps
+                    print(f"Scanning canvas to detect all gaps...")
+                    packer.rebuild_free_rectangles_from_canvas()
 
                     # Use the new direct gap-filling method
                     added_count = packer.fill_gaps_with_repeats(
