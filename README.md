@@ -42,10 +42,21 @@ This will read images from `input_images/` and save to `output_images/collage.pn
 - `-W`, `--width`: Width of output canvas in pixels (required)
 - `-H`, `--height`: Height of output canvas in pixels (required)
 - `-o`, `--output`: Output file path (default: output_images/collage.png)
+- `-n`, `--images-per-collage`: Number of images per collage (creates multiple collages if needed)
+- `-p`, `--num-collages`: Number of collages to create (divides images evenly)
+- `-j`, `--jobs`: Number of parallel workers for creating collages (default: auto-detect number of CPUs)
 - `--respect-original-size`: Maintain relative size differences between images (default: make all images roughly equal in size, then grow to fill whitespace)
-- `--max-size-variation`: Maximum percentage variation in image sizes (default: 10.0)
-- `--overlap-percent`: Percentage of overlap allowed between images (default: 5.0)
+- `--max-size-variation`: Maximum percentage variation in image area from average (default: 15.0)
+- `--overlap-percent`: Percentage of overlap allowed between images (default: 10.0)
+- `--no-uniformity`: Skip area uniformity enforcement to maximize coverage (images may vary more in size)
 - `--background-color`: Background color as R,G,B (default: 255,255,255 for white)
+
+**Notes:**
+- You cannot specify both `-n` and `-p` at the same time
+- Parallel processing is automatically enabled when creating multiple collages
+- Use `-j 1` to force sequential processing
+- With `--overlap-percent 0`, area uniformity enforcement is automatically skipped for better coverage
+- Use `--no-uniformity` to prioritize maximum coverage over uniform image sizes
 
 ### Examples
 
@@ -84,6 +95,80 @@ No overlap, minimal size variation for stricter uniformity:
 ```bash
 uv run image_packer.py -W 1920 -H 1080 --max-size-variation 5 --overlap-percent 0
 ```
+
+Create multiple collages with 5 images each:
+```bash
+uv run image_packer.py -W 1920 -H 1080 -n 5
+# If you have 23 images, this creates 5 collages (4 with 5 images, 1 with 3 images)
+# Output: collage_001.png, collage_002.png, ..., collage_005.png
+```
+
+Create exactly 3 collages (divides images evenly):
+```bash
+uv run image_packer.py -W 1920 -H 1080 -p 3
+# If you have 23 images, this creates 3 collages with 8, 8, and 7 images
+# Output: collage_001.png, collage_002.png, collage_003.png
+```
+
+Create 4-image collages with custom output directory:
+```bash
+uv run image_packer.py -W 1920 -H 1080 -n 4 -o output_images/grid.png
+# Output: output_images/grid_001.png, grid_002.png, grid_003.png, etc.
+```
+
+Use all available CPUs for parallel processing (automatic):
+```bash
+uv run image_packer.py -W 1920 -H 1080 -n 5
+# Automatically uses all available CPU cores to process collages in parallel
+```
+
+Limit parallel workers to 8:
+```bash
+uv run image_packer.py -W 1920 -H 1080 -n 5 -j 8
+# Uses maximum of 8 parallel workers
+```
+
+Force sequential processing:
+```bash
+uv run image_packer.py -W 1920 -H 1080 -n 5 -j 1
+# Process collages one at a time (useful for debugging)
+```
+
+Maximize coverage with no overlap (best for filling the canvas):
+```bash
+uv run image_packer.py -W 1920 -H 1080 --overlap-percent 0 -n 8
+# Automatically skips area uniformity enforcement for better coverage
+# Images grow aggressively to fill space (may vary more in size)
+```
+
+Force maximum coverage mode:
+```bash
+uv run image_packer.py -W 1920 -H 1080 --no-uniformity
+# Skip area uniformity enforcement entirely
+# Prioritizes filling canvas over uniform image sizes
+```
+
+## Performance
+
+### Parallel Processing
+
+When creating multiple collages (using `-n` or `-p` flags), the tool automatically parallelizes the work across all available CPU cores:
+
+- **Automatic**: By default, uses all available CPUs
+- **Scalable**: Near-linear speedup for multiple collages (e.g., 32 CPUs ≈ 32x faster)
+- **Efficient**: Each collage is processed independently in parallel
+- **Progress tracking**: Real-time progress bar shows completed collages
+
+**Example performance gains:**
+- Creating 32 collages on a 32-core CPU: ~32x faster than sequential
+- Creating 100 collages with `-j 16`: processes 16 at a time
+
+### Optimization Features
+
+- **Iterative area uniformity enforcement**: Converges quickly to meet strict area constraints
+- **Binary search scaling**: 30 iterations for precise space optimization
+- **Progress bars**: Visual feedback for all long-running operations
+- **Efficient constraint checking**: Optimized overlap and bounds validation
 
 ## Algorithm
 

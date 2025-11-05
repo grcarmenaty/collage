@@ -15,6 +15,10 @@ from PIL import Image
 import math
 import numpy as np
 from scipy.optimize import minimize
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import random
 
 
 @dataclass
@@ -46,48 +50,57 @@ class Rectangle:
     height: int
 
 
+# Maximum images per batch to prevent memory crashes
+# Lower limit is critical for area uniformity optimization which uses O(n^2) constraints
+MAX_IMAGES_PER_BATCH = 50
+
+
 class ImagePacker:
     """Packs images into a canvas using a guillotine-based algorithm."""
 
     def __init__(self, canvas_width: int, canvas_height: int,
                  respect_original_size: bool = False,
                  max_size_variation: float = 15.0,
-                 overlap_percent: float = 10.0):
+                 overlap_percent: float = 10.0,
+                 no_uniformity: bool = False,
+                 randomize: bool = False):
         self.canvas_width = canvas_width
         self.canvas_height = canvas_height
         self.respect_original_size = respect_original_size
         self.max_size_variation = max_size_variation / 100.0  # Convert to decimal
         self.overlap_percent = overlap_percent / 100.0  # Convert to decimal
+        self.no_uniformity = no_uniformity
+        self.randomize = randomize
         self.free_rectangles: List[Rectangle] = [Rectangle(0, 0, canvas_width, canvas_height)]
         self.packed_images: List[PackedImage] = []
 
     def load_images(self, folder_path: str) -> List[ImageInfo]:
-        """Load all images from a folder."""
-        supported_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+        """Load all images from a folder (excludes GIFs)."""
+        supported_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
         images = []
 
         if not os.path.exists(folder_path):
             raise ValueError(f"Folder not found: {folder_path}")
 
-        for filename in sorted(os.listdir(folder_path)):
-            file_path = os.path.join(folder_path, filename)
-            if not os.path.isfile(file_path):
-                continue
+        # Get list of files first to show progress
+        all_files = sorted(os.listdir(folder_path))
+        image_files = [f for f in all_files if os.path.isfile(os.path.join(folder_path, f)) and
+                      os.path.splitext(f)[1].lower() in supported_formats]
 
-            ext = os.path.splitext(filename)[1].lower()
-            if ext in supported_formats:
-                try:
-                    img = Image.open(file_path)
-                    width, height = img.size
-                    images.append(ImageInfo(
-                        path=file_path,
-                        original_width=width,
-                        original_height=height,
-                        aspect_ratio=width / height,
-                        image=img
-                    ))
-                except Exception as e:
-                    print(f"Warning: Could not load {filename}: {e}")
+        for filename in tqdm(image_files, desc="Loading images", unit="img"):
+            file_path = os.path.join(folder_path, filename)
+            try:
+                img = Image.open(file_path)
+                width, height = img.size
+                images.append(ImageInfo(
+                    path=file_path,
+                    original_width=width,
+                    original_height=height,
+                    aspect_ratio=width / height,
+                    image=img
+                ))
+            except Exception as e:
+                tqdm.write(f"Warning: Could not load {filename}: {e}")
 
         return images
 
@@ -176,53 +189,57 @@ class ImagePacker:
 
         return estimated_scale
 
-    def try_pack_with_scale(self, images: List[ImageInfo], scale: float) -> bool:
-        """Try to pack all images with a given scale factor."""
+    def try_pack_with_target_areas(self, images: List[ImageInfo], area_scale: float = 1.0) -> bool:
+        """
+        Pack images where each has a target area of (canvas_area / n) * area_scale.
+
+        Args:
+            area_scale: Multiplier for target area (1.0 = perfect equal areas, <1.0 = smaller for safety)
+        """
         self.free_rectangles = [Rectangle(0, 0, self.canvas_width, self.canvas_height)]
         self.packed_images = []
 
-        # Sort images by area (largest first) for better packing
-        sorted_images = sorted(images,
-                             key=lambda img: img.original_width * img.original_height,
-                             reverse=True)
+        # Sort images by area (largest first) for better packing, unless randomize is enabled
+        if self.randomize:
+            sorted_images = images.copy()
+            random.shuffle(sorted_images)
+        else:
+            sorted_images = sorted(images,
+                                 key=lambda img: img.original_width * img.original_height,
+                                 reverse=True)
 
-        # Calculate target area per image for equal sizing (when not respecting original size)
-        if not self.respect_original_size:
-            canvas_area = self.canvas_width * self.canvas_height
-            # Start optimistic - binary search will find the actual maximum
-            target_area_per_image = (canvas_area * 1.0) / len(images)
+        # Calculate target area per image
+        canvas_area = self.canvas_width * self.canvas_height
+        target_area_per_image = (canvas_area / len(images)) * area_scale
 
         for img_info in sorted_images:
             if self.respect_original_size:
-                # Use uniform scaling, respecting original size
+                # Use proportional sizing based on original areas
+                original_area = img_info.original_width * img_info.original_height
+                scale = math.sqrt(target_area_per_image / original_area)
                 scaled_width = int(img_info.original_width * scale)
                 scaled_height = int(img_info.original_height * scale)
-
                 # Do not exceed original dimensions
                 scaled_width = min(scaled_width, img_info.original_width)
                 scaled_height = min(scaled_height, img_info.original_height)
             else:
-                # Calculate individual scale to make images roughly equal in size
+                # Size each image to exactly target_area while respecting aspect ratio
                 original_area = img_info.original_width * img_info.original_height
+                aspect_ratio = img_info.aspect_ratio
 
-                # Scale to achieve target area
-                individual_scale = math.sqrt(target_area_per_image / original_area)
+                # Calculate dimensions for target area with this aspect ratio
+                # area = width * height, and width = height * aspect_ratio
+                # So: area = height^2 * aspect_ratio
+                # Therefore: height = sqrt(area / aspect_ratio)
+                height = math.sqrt(target_area_per_image / aspect_ratio)
+                width = height * aspect_ratio
 
-                # Apply global adjustment factor
-                individual_scale *= scale
-
-                scaled_width = int(img_info.original_width * individual_scale)
-                scaled_height = int(img_info.original_height * individual_scale)
+                scaled_width = int(width)
+                scaled_height = int(height)
 
             # Ensure minimum size
             scaled_width = max(1, scaled_width)
             scaled_height = max(1, scaled_height)
-
-            # OPTIMIZATION: Try to fit a larger version if space allows
-            if not self.respect_original_size:
-                scaled_width, scaled_height = self._optimize_image_size_for_space(
-                    img_info, scaled_width, scaled_height, target_area_per_image
-                )
 
             # Find a place to fit this image
             fit = self.find_best_fit(scaled_width, scaled_height)
@@ -324,139 +341,160 @@ class ImagePacker:
 
         # Maximum allowed area is based on canvas area and number of images
         # With high variation, some images can be much larger
-        max_allowed_area = (canvas_area / len(self.packed_images)) * (1 + self.max_size_variation)
+        # When overlap is very low, be MUCH more aggressive since we won't be able
+        # to enforce uniformity later - prioritize coverage over uniformity
+        if self.overlap_percent < 0.05:
+            # No uniformity enforcement later, so allow images to grow much larger
+            max_allowed_area = (canvas_area / len(self.packed_images)) * 5.0  # Very aggressive
+            num_passes = 10  # More passes to fill space
+        else:
+            # Will enforce uniformity later, so moderate growth
+            max_allowed_area = (canvas_area / len(self.packed_images)) * (1 + self.max_size_variation)
+            num_passes = 5
 
         # Multiple aggressive growth passes - more passes for better filling
-        for growth_pass in range(5):
-            # Track if any changes were made
-            any_changes = False
+        with tqdm(total=num_passes, desc="Growing images to fill space", unit="pass", leave=False) as pbar:
+            for growth_pass in range(num_passes):
+                # Track if any changes were made
+                any_changes = False
 
-            # Sort by current size (smallest first) to help smaller images catch up
-            sorted_indices = sorted(range(len(self.packed_images)),
-                                  key=lambda i: self.packed_images[i].width * self.packed_images[i].height)
+                # Sort by current size (smallest first) to help smaller images catch up
+                sorted_indices = sorted(range(len(self.packed_images)),
+                                      key=lambda i: self.packed_images[i].width * self.packed_images[i].height)
 
-            for i in sorted_indices:
-                packed = self.packed_images[i]
-                current_area = packed.width * packed.height
-                initial_size = (packed.width, packed.height)
+                for i in sorted_indices:
+                    packed = self.packed_images[i]
+                    current_area = packed.width * packed.height
+                    initial_size = (packed.width, packed.height)
 
-                # Allow continued growth, but with diminishing returns
-                # Smaller images can grow more aggressively
-                size_ratio = current_area / median_area if median_area > 0 else 1.0
-                adjusted_max_area = max_allowed_area
+                    # Allow continued growth, but with diminishing returns
+                    # Smaller images can grow more aggressively
+                    size_ratio = current_area / median_area if median_area > 0 else 1.0
+                    adjusted_max_area = max_allowed_area
 
-                # If already large, reduce max allowed area
-                if size_ratio > 1.0:
-                    adjusted_max_area = current_area * (1 + (self.max_size_variation * 0.5))
+                    # If already large, reduce max allowed area
+                    if size_ratio > 1.0:
+                        adjusted_max_area = current_area * (1 + (self.max_size_variation * 0.5))
 
-                aspect_ratio = packed.info.aspect_ratio
+                    aspect_ratio = packed.info.aspect_ratio
 
-                # AGGRESSIVE STRATEGY 1: Maximum width growth with overlap allowed
-                max_width = self.canvas_width - packed.x
-                new_width = max_width
-                new_height = int(new_width / aspect_ratio)
-
-                # Check if within canvas and size variation limits
-                if new_height <= self.canvas_height - packed.y:
-                    new_area = new_width * new_height
-                    if new_area <= adjusted_max_area:
-                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                            packed.width = new_width
-                            packed.height = new_height
-                            any_changes = True
-                            continue
-
-                # AGGRESSIVE STRATEGY 2: Maximum height growth with overlap allowed
-                max_height = self.canvas_height - packed.y
-                new_height = max_height
-                new_width = int(new_height * aspect_ratio)
-
-                if new_width <= self.canvas_width - packed.x:
-                    new_area = new_width * new_height
-                    if new_area <= adjusted_max_area:
-                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                            packed.width = new_width
-                            packed.height = new_height
-                            any_changes = True
-                            continue
-
-                # AGGRESSIVE STRATEGY 3: Grow to fill available space
-                available_width = self.canvas_width - packed.x
-                available_height = self.canvas_height - packed.y
-                available_area = available_width * available_height
-
-                target_area = min(adjusted_max_area, available_area * 0.9)  # Use 90% of available
-                target_dimension = math.sqrt(target_area)
-
-                # Calculate dimensions based on aspect ratio
-                if aspect_ratio >= 1:
-                    new_height = int(target_dimension / math.sqrt(aspect_ratio))
-                    new_width = int(new_height * aspect_ratio)
-                else:
-                    new_width = int(target_dimension * math.sqrt(aspect_ratio))
+                    # AGGRESSIVE STRATEGY 1: Maximum width growth with overlap allowed
+                    max_width = self.canvas_width - packed.x
+                    new_width = max_width
                     new_height = int(new_width / aspect_ratio)
 
-                # Make sure we fit in canvas
-                new_width = min(new_width, self.canvas_width - packed.x)
-                new_height = min(new_height, self.canvas_height - packed.y)
+                    # Check if within canvas and size variation limits
+                    if new_height <= self.canvas_height - packed.y:
+                        new_area = new_width * new_height
+                        if new_area <= adjusted_max_area:
+                            if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                packed.width = new_width
+                                packed.height = new_height
+                                any_changes = True
+                                continue
 
-                if new_width > packed.width and new_height > packed.height:
-                    if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                        packed.width = new_width
-                        packed.height = new_height
-                        any_changes = True
-                        continue
+                    # AGGRESSIVE STRATEGY 2: Maximum height growth with overlap allowed
+                    max_height = self.canvas_height - packed.y
+                    new_height = max_height
+                    new_width = int(new_height * aspect_ratio)
 
-                # AGGRESSIVE STRATEGY 4: Incremental growth with overlap
-                # Try to grow by 30% each iteration
-                growth_factor = 1.3
-                new_width = int(packed.width * growth_factor)
-                new_height = int(packed.height * growth_factor)
+                    if new_width <= self.canvas_width - packed.x:
+                        new_area = new_width * new_height
+                        if new_area <= adjusted_max_area:
+                            if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                packed.width = new_width
+                                packed.height = new_height
+                                any_changes = True
+                                continue
 
-                # Constrain to canvas
-                new_width = min(new_width, self.canvas_width - packed.x)
-                new_height = min(new_height, self.canvas_height - packed.y)
+                    # AGGRESSIVE STRATEGY 3: Grow to fill available space
+                    available_width = self.canvas_width - packed.x
+                    available_height = self.canvas_height - packed.y
+                    available_area = available_width * available_height
 
-                new_area = new_width * new_height
-                if new_area <= adjusted_max_area and (new_width > packed.width or new_height > packed.height):
-                    if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
-                        packed.width = new_width
-                        packed.height = new_height
-                        any_changes = True
+                    target_area = min(adjusted_max_area, available_area * 0.9)  # Use 90% of available
+                    target_dimension = math.sqrt(target_area)
 
-            # If no changes were made in this pass, we're done
-            if not any_changes:
-                break
+                    # Calculate dimensions based on aspect ratio
+                    if aspect_ratio >= 1:
+                        new_height = int(target_dimension / math.sqrt(aspect_ratio))
+                        new_width = int(new_height * aspect_ratio)
+                    else:
+                        new_width = int(target_dimension * math.sqrt(aspect_ratio))
+                        new_height = int(new_width / aspect_ratio)
 
-    def enforce_size_uniformity(self, max_dimension_variation: float = 0.05):
+                    # Make sure we fit in canvas
+                    new_width = min(new_width, self.canvas_width - packed.x)
+                    new_height = min(new_height, self.canvas_height - packed.y)
+
+                    if new_width > packed.width and new_height > packed.height:
+                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                            packed.width = new_width
+                            packed.height = new_height
+                            any_changes = True
+                            continue
+
+                    # AGGRESSIVE STRATEGY 4: Incremental growth with overlap
+                    # Try to grow by 30% each iteration
+                    growth_factor = 1.3
+                    new_width = int(packed.width * growth_factor)
+                    new_height = int(packed.height * growth_factor)
+
+                    # Constrain to canvas
+                    new_width = min(new_width, self.canvas_width - packed.x)
+                    new_height = min(new_height, self.canvas_height - packed.y)
+
+                    new_area = new_width * new_height
+                    if new_area <= adjusted_max_area and (new_width > packed.width or new_height > packed.height):
+                        if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                            packed.width = new_width
+                            packed.height = new_height
+                            any_changes = True
+
+                # If no changes were made in this pass, we're done
+                if not any_changes:
+                    break
+
+                pbar.update(1)
+
+    def enforce_area_uniformity(self, max_area_variation: float = 0.05):
         """
-        Enforce size uniformity using constrained optimization.
+        Enforce area uniformity using iterative constrained optimization.
+
+        This is a HARD constraint that iterates until all images have areas within
+        max_area_variation of the average area.
 
         Balances multiple objectives:
         - Minimize area deviation from average (uniformity)
         - Maximize total coverage
 
-        Subject to constraints:
+        Subject to HARD constraints:
         - No overlaps > overlap_percent
         - Stay within canvas bounds
-        - Area within variation limits
+        - Area within variation limits (ENFORCED)
         - Preserve aspect ratios
 
         Args:
-            max_dimension_variation: Maximum allowed variation in area (default 0.05 = 5%)
+            max_area_variation: Maximum allowed variation in area from average (default 0.05 = 5%)
         """
         if not self.packed_images:
             return
 
         n = len(self.packed_images)
 
-        # Calculate target average area
-        avg_area = sum(p.width * p.height for p in self.packed_images) / n
-        min_area = max(1, avg_area * (1 - max_dimension_variation))
-        max_area = avg_area * (1 + max_dimension_variation)
+        # Memory safety: skip uniformity for very large batches (O(n^2) constraints)
+        if n > MAX_IMAGES_PER_BATCH:
+            tqdm.write(f"⚠ Skipping area uniformity for {n} images (exceeds limit of {MAX_IMAGES_PER_BATCH})")
+            tqdm.write(f"   This batch has too many images for memory-safe optimization")
+            tqdm.write(f"   Use --no-uniformity flag or reduce images per canvas")
+            return
 
-        # Initial guess: current scale factors (1.0 means keep current size)
-        x0 = np.ones(n)
+        max_iterations = 10  # Reduced from 50 for performance
+
+        # For large numbers of images, optimization can be slow
+        if n > 10:
+            tqdm.write(f"Enforcing area uniformity for {n} images (this may take a moment)...")
+            tqdm.write(f"Tip: Use --no-uniformity to skip this step for faster processing")
 
         # Store original sizes for reference
         original_widths = np.array([p.width for p in self.packed_images])
@@ -465,122 +503,182 @@ class ImagePacker:
         positions_x = np.array([p.x for p in self.packed_images])
         positions_y = np.array([p.y for p in self.packed_images])
 
-        def get_dimensions(scales):
-            """Calculate widths and heights from scale factors."""
-            widths = original_widths * scales
-            heights = original_heights * scales
-            return widths, heights
+        # Iteratively enforce area uniformity
+        with tqdm(total=max_iterations, desc="Enforcing area uniformity", unit="iter") as pbar:
+            for iteration in range(max_iterations):
+                # Calculate current average area
+                current_areas = np.array([p.width * p.height for p in self.packed_images])
+                avg_area = np.mean(current_areas)
+                min_area = max(1, avg_area * (1 - max_area_variation))
+                max_area = avg_area * (1 + max_area_variation)
 
-        def objective(scales):
-            """Minimize deviation from uniform area."""
-            widths, heights = get_dimensions(scales)
-            areas = widths * heights
-            # Penalize deviation from average area
-            uniformity_penalty = np.sum((areas - avg_area) ** 2)
-            # Small penalty for shrinking (encourages coverage)
-            shrink_penalty = np.sum((1 - scales) ** 2) * 0.1
-            return uniformity_penalty + shrink_penalty
+                # Check if all images meet the area constraint
+                areas_in_range = np.all((current_areas >= min_area) & (current_areas <= max_area))
 
-        def overlap_constraint(scales, i, j):
-            """Constraint: overlap between images i and j must be <= overlap_percent."""
-            widths, heights = get_dimensions(scales)
+                # Update progress bar with current deviation
+                max_deviation = np.max(np.abs(current_areas - avg_area) / avg_area) * 100
+                pbar.set_postfix({'max_dev': f'{max_deviation:.2f}%'})
+                pbar.update(1)
 
-            # Calculate overlap
-            x1, y1, w1, h1 = positions_x[i], positions_y[i], widths[i], heights[i]
-            x2, y2, w2, h2 = positions_x[j], positions_y[j], widths[j], heights[j]
+                if areas_in_range:
+                    # Success! All images meet the area constraint
+                    pbar.set_description(f"✓ Area uniformity achieved")
+                    break
 
-            overlap_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-            overlap_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+                # Early termination: if deviation is acceptable (within 2x the target), good enough
+                if max_deviation <= max_area_variation * 200:  # 2x tolerance
+                    pbar.set_description(f"✓ Area uniformity acceptable")
+                    break
 
-            if overlap_x > 0 and overlap_y > 0:
-                overlap_area = overlap_x * overlap_y
-                area1 = w1 * h1
-                area2 = w2 * h2
+                # Update reference sizes for this iteration
+                current_widths = np.array([p.width for p in self.packed_images])
+                current_heights = np.array([p.height for p in self.packed_images])
 
-                # Constraint: overlap_area / area1 <= overlap_percent (return non-negative when satisfied)
-                max_overlap_1 = area1 * self.overlap_percent - overlap_area
-                max_overlap_2 = area2 * self.overlap_percent - overlap_area
+                # Initial guess: scale factors to bring areas closer to average
+                x0 = np.sqrt(avg_area / current_areas)
 
-                return min(max_overlap_1, max_overlap_2)
+                def get_dimensions(scales):
+                    """Calculate widths and heights from scale factors."""
+                    widths = current_widths * scales
+                    heights = current_heights * scales
+                    return widths, heights
 
-            return 0.0  # No overlap is always OK
+                def objective(scales):
+                    """Minimize deviation from uniform area."""
+                    widths, heights = get_dimensions(scales)
+                    areas = widths * heights
+                    # Strongly penalize deviation from average area
+                    uniformity_penalty = np.sum((areas - avg_area) ** 2)
+                    return uniformity_penalty
 
-        def canvas_constraint_width(scales, i):
-            """Constraint: image i must fit within canvas width."""
-            widths, _ = get_dimensions(scales)
-            return self.canvas_width - (positions_x[i] + widths[i])
+                def overlap_constraint(scales, i, j):
+                    """Constraint: overlap between images i and j must be <= overlap_percent."""
+                    widths, heights = get_dimensions(scales)
 
-        def canvas_constraint_height(scales, i):
-            """Constraint: image i must fit within canvas height."""
-            _, heights = get_dimensions(scales)
-            return self.canvas_height - (positions_y[i] + heights[i])
+                    # Calculate overlap
+                    x1, y1, w1, h1 = positions_x[i], positions_y[i], widths[i], heights[i]
+                    x2, y2, w2, h2 = positions_x[j], positions_y[j], widths[j], heights[j]
 
-        def area_constraint_min(scales, i):
-            """Constraint: image i area must be >= min_area."""
-            widths, heights = get_dimensions(scales)
-            area = widths[i] * heights[i]
-            return area - min_area
+                    overlap_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+                    overlap_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
 
-        def area_constraint_max(scales, i):
-            """Constraint: image i area must be <= max_area."""
-            widths, heights = get_dimensions(scales)
-            area = widths[i] * heights[i]
-            return max_area - area
+                    if overlap_x > 0 and overlap_y > 0:
+                        overlap_area = overlap_x * overlap_y
+                        area1 = w1 * h1
+                        area2 = w2 * h2
 
-        # Build constraints list
-        constraints = []
+                        # Constraint: overlap_area / area1 <= overlap_percent (return non-negative when satisfied)
+                        max_overlap_1 = area1 * self.overlap_percent - overlap_area
+                        max_overlap_2 = area2 * self.overlap_percent - overlap_area
 
-        # Overlap constraints for all pairs
-        for i in range(n):
-            for j in range(i + 1, n):
-                constraints.append({
-                    'type': 'ineq',
-                    'fun': overlap_constraint,
-                    'args': (i, j)
-                })
+                        return min(max_overlap_1, max_overlap_2)
 
-        # Canvas bounds constraints
-        for i in range(n):
-            constraints.append({'type': 'ineq', 'fun': canvas_constraint_width, 'args': (i,)})
-            constraints.append({'type': 'ineq', 'fun': canvas_constraint_height, 'args': (i,)})
-            constraints.append({'type': 'ineq', 'fun': area_constraint_min, 'args': (i,)})
-            constraints.append({'type': 'ineq', 'fun': area_constraint_max, 'args': (i,)})
+                    return 0.0  # No overlap is always OK
 
-        # Bounds: scales must be positive, but allow shrinking to very small
-        bounds = [(0.01, 2.0) for _ in range(n)]
+                def canvas_constraint_width(scales, i):
+                    """Constraint: image i must fit within canvas width."""
+                    widths, _ = get_dimensions(scales)
+                    return self.canvas_width - (positions_x[i] + widths[i])
 
-        # Solve optimization problem
-        result = minimize(
-            objective,
-            x0,
-            method='SLSQP',
-            bounds=bounds,
-            constraints=constraints,
-            options={'maxiter': 1000, 'ftol': 1e-6}
-        )
+                def canvas_constraint_height(scales, i):
+                    """Constraint: image i must fit within canvas height."""
+                    _, heights = get_dimensions(scales)
+                    return self.canvas_height - (positions_y[i] + heights[i])
 
-        # Apply optimized scales
-        if result.success:
-            optimal_scales = result.x
-            for i, packed in enumerate(self.packed_images):
-                new_width = int(original_widths[i] * optimal_scales[i])
-                new_height = int(original_heights[i] * optimal_scales[i])
-                packed.width = max(1, new_width)
-                packed.height = max(1, new_height)
-        else:
-            # Fallback: if optimization fails, shrink images to eliminate overlaps
-            for i, packed in enumerate(self.packed_images):
-                # Try progressively smaller sizes
-                for scale in np.linspace(1.0, 0.1, 20):
-                    test_width = int(original_widths[i] * scale)
-                    test_height = int(original_heights[i] * scale)
+                def area_constraint_min(scales, i):
+                    """Constraint: image i area must be >= min_area."""
+                    widths, heights = get_dimensions(scales)
+                    area = widths[i] * heights[i]
+                    return area - min_area
 
-                    if (test_width <= self.canvas_width - packed.x and
-                        test_height <= self.canvas_height - packed.y):
-                        if self._check_space_available_with_overlap(packed.x, packed.y, test_width, test_height, i):
-                            packed.width = max(1, test_width)
-                            packed.height = max(1, test_height)
-                            break
+                def area_constraint_max(scales, i):
+                    """Constraint: image i area must be <= max_area."""
+                    widths, heights = get_dimensions(scales)
+                    area = widths[i] * heights[i]
+                    return max_area - area
+
+                # Build constraints list
+                constraints = []
+
+                # Overlap constraints for all pairs
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        constraints.append({
+                            'type': 'ineq',
+                            'fun': overlap_constraint,
+                            'args': (i, j)
+                        })
+
+                # Canvas bounds and area constraints
+                for i in range(n):
+                    constraints.append({'type': 'ineq', 'fun': canvas_constraint_width, 'args': (i,)})
+                    constraints.append({'type': 'ineq', 'fun': canvas_constraint_height, 'args': (i,)})
+                    constraints.append({'type': 'ineq', 'fun': area_constraint_min, 'args': (i,)})
+                    constraints.append({'type': 'ineq', 'fun': area_constraint_max, 'args': (i,)})
+
+                # Bounds: scales must be positive, allow wider range for adjustment
+                bounds = [(0.1, 3.0) for _ in range(n)]
+
+                # Solve optimization problem - reduced iterations for speed
+                result = minimize(
+                    objective,
+                    x0,
+                    method='SLSQP',
+                    bounds=bounds,
+                    constraints=constraints,
+                    options={'maxiter': 100, 'ftol': 1e-4}  # Much faster: 100 iter, looser tolerance
+                )
+
+                # Apply optimized scales
+                if result.success:
+                    optimal_scales = result.x
+                    for i, packed in enumerate(self.packed_images):
+                        new_width = int(current_widths[i] * optimal_scales[i])
+                        new_height = int(current_heights[i] * optimal_scales[i])
+                        packed.width = max(1, new_width)
+                        packed.height = max(1, new_height)
+                else:
+                    # If optimization fails, try aggressive shrinking to meet constraints
+                    pbar.write(f"Optimization failed at iteration {iteration}, trying fallback strategy")
+                    for i, packed in enumerate(self.packed_images):
+                        current_area = current_areas[i]
+
+                        # If too large, shrink to max_area
+                        if current_area > max_area:
+                            scale = math.sqrt(max_area / current_area) * 0.95  # 95% to ensure we're under
+                            new_width = int(current_widths[i] * scale)
+                            new_height = int(current_heights[i] * scale)
+
+                            if (new_width <= self.canvas_width - packed.x and
+                                new_height <= self.canvas_height - packed.y):
+                                if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                    packed.width = max(1, new_width)
+                                    packed.height = max(1, new_height)
+
+                        # If too small, try to grow to min_area
+                        elif current_area < min_area:
+                            scale = math.sqrt(min_area / current_area) * 1.05  # 105% to ensure we're over
+                            new_width = int(current_widths[i] * scale)
+                            new_height = int(current_heights[i] * scale)
+
+                            if (new_width <= self.canvas_width - packed.x and
+                                new_height <= self.canvas_height - packed.y):
+                                if self._check_space_available_with_overlap(packed.x, packed.y, new_width, new_height, i):
+                                    packed.width = max(1, new_width)
+                                    packed.height = max(1, new_height)
+
+        # Final check
+        final_areas = np.array([p.width * p.height for p in self.packed_images])
+        final_avg_area = np.mean(final_areas)
+        final_min_area = final_avg_area * (1 - max_area_variation)
+        final_max_area = final_avg_area * (1 + max_area_variation)
+
+        if not np.all((final_areas >= final_min_area) & (final_areas <= final_max_area)):
+            max_deviation = np.max(np.abs(final_areas - final_avg_area) / final_avg_area)
+            # Only warn if deviation is significantly over target
+            if max_deviation > max_area_variation * 1.5:
+                tqdm.write(f"Note: Area deviation {max_deviation * 100:.1f}% exceeds target {max_area_variation * 100:.0f}%")
+                tqdm.write(f"Tip: Use --no-uniformity for faster processing with higher coverage")
 
     def _check_space_available_with_overlap(self, x: int, y: int, width: int, height: int, exclude_index: int) -> bool:
         """
@@ -636,35 +734,57 @@ class ImagePacker:
         return True
 
     def pack(self, images: List[ImageInfo]) -> List[PackedImage]:
-        """Pack all images into the canvas, finding the optimal scale."""
+        """
+        Pack all images into the canvas.
+
+        NEW APPROACH: Start with each image having area = canvas_area / n,
+        then iterate to find the best fit.
+        """
         if not images:
             return []
 
-        # Binary search for the best scale factor
-        min_scale = 0.01
-        max_scale = self.calculate_scale_factor(images) * 3  # More aggressive upper bound
-        best_scale = min_scale
+        # Start with target area = canvas_area / n images
+        # Use slightly less (95%) to account for packing inefficiency
+        area_scale = 0.95
+        best_scale = area_scale
 
-        # Try to find the largest scale that fits all images
-        # More iterations for better precision = better space utilization
-        for _ in range(30):
-            mid_scale = (min_scale + max_scale) / 2
-
-            if self.try_pack_with_scale(images, mid_scale):
-                best_scale = mid_scale
-                min_scale = mid_scale
-            else:
-                max_scale = mid_scale
+        # Try progressively smaller sizes until packing succeeds
+        # This is much faster than binary search since we start close to optimal
+        with tqdm(total=10, desc="Finding optimal packing", unit="try", leave=False) as pbar:
+            for attempt in range(10):
+                if self.try_pack_with_target_areas(images, area_scale):
+                    best_scale = area_scale
+                    pbar.set_postfix({'coverage': f'{area_scale*100:.0f}%'})
+                    pbar.update(1)
+                    break
+                else:
+                    # Reduce target area by 5% and try again
+                    area_scale *= 0.95
+                    pbar.set_postfix({'trying': f'{area_scale*100:.0f}%'})
+                    pbar.update(1)
 
         # Pack with the best scale found
-        self.try_pack_with_scale(images, best_scale)
+        if not self.packed_images:
+            self.try_pack_with_target_areas(images, best_scale)
 
-        # Grow images to fill remaining whitespace (allows slight size variations)
-        # This prioritizes space utilization over perfect size equality
-        if not self.respect_original_size:
+        # Optionally grow images to fill remaining whitespace
+        # Since we start with equal areas, growth should be minimal
+        if not self.respect_original_size and not self.no_uniformity:
+            # Light growth pass to fill small gaps
             self.grow_images_to_fill_space()
-            # Enforce strict size uniformity using the user's max_size_variation parameter
-            self.enforce_size_uniformity(max_dimension_variation=self.max_size_variation)
+
+            # Enforce area uniformity if conditions allow
+            # With 0% or very low overlap, we can't adjust sizes without overlaps
+            if self.overlap_percent < 0.05:  # Less than 5% overlap
+                tqdm.write(f"Skipping area uniformity enforcement (overlap={self.overlap_percent*100:.0f}%)")
+                tqdm.write(f"Tip: Use --overlap-percent 5 for better uniformity, or --no-uniformity for max coverage")
+            else:
+                # Since we started with equal areas, enforcement should converge quickly
+                self.enforce_area_uniformity(max_area_variation=self.max_size_variation)
+        elif self.no_uniformity and not self.respect_original_size:
+            # Maximum coverage mode - aggressive growth
+            self.grow_images_to_fill_space()
+            tqdm.write("Skipped area uniformity enforcement (--no-uniformity flag)")
 
         return self.packed_images
 
@@ -687,6 +807,741 @@ class ImagePacker:
             canvas.paste(resized, (packed.x, packed.y))
 
         return canvas
+
+
+def aspect_ratios_are_equivalent(ar1: float, ar2: float, tolerance_percent: float) -> bool:
+    """
+    Check if two aspect ratios are within the specified tolerance percentage.
+
+    Args:
+        ar1: First aspect ratio
+        ar2: Second aspect ratio
+        tolerance_percent: Tolerance as percentage (e.g., 5 for 5%)
+
+    Returns:
+        True if aspect ratios are within tolerance, False otherwise
+    """
+    if tolerance_percent <= 0:
+        # Exact matching with rounding to 3 decimal places
+        return round(ar1, 3) == round(ar2, 3)
+
+    # Calculate percentage difference
+    if ar1 == 0 or ar2 == 0:
+        return ar1 == ar2
+
+    diff_percent = abs(ar1 - ar2) / min(ar1, ar2) * 100
+    return diff_percent <= tolerance_percent
+
+
+def aspect_ratio_in_set(ar: float, ar_set: set, tolerance_percent: float) -> bool:
+    """
+    Check if an aspect ratio is equivalent to any aspect ratio in the set.
+
+    Args:
+        ar: Aspect ratio to check
+        ar_set: Set of aspect ratios to check against
+        tolerance_percent: Tolerance as percentage
+
+    Returns:
+        True if any aspect ratio in set is within tolerance
+    """
+    for existing_ar in ar_set:
+        if aspect_ratios_are_equivalent(ar, existing_ar, tolerance_percent):
+            return True
+    return False
+
+
+def pre_distribute_forced_duplicates(images: List[ImageInfo], num_batches: int,
+                                     no_repeats_tolerance: float) -> tuple:
+    """
+    Pre-distribute images when there are more images with the same aspect ratio
+    than available batches. This ensures ALL images are used by distributing
+    duplicates evenly across batches as a hard rule before optimization.
+
+    Args:
+        images: List of images to distribute
+        num_batches: Number of batches to create
+        no_repeats_tolerance: Tolerance for aspect ratio matching
+
+    Returns:
+        Tuple of (pre_allocated_batches, remaining_images, batch_aspect_counts)
+    """
+    if no_repeats_tolerance <= 0:
+        return None, images, None
+
+    # Group images by aspect ratio (within tolerance)
+    aspect_groups = {}
+    for img in images:
+        found_group = False
+        for ar_key in aspect_groups.keys():
+            if aspect_ratios_are_equivalent(img.aspect_ratio, ar_key, no_repeats_tolerance):
+                aspect_groups[ar_key].append(img)
+                found_group = True
+                break
+        if not found_group:
+            aspect_groups[img.aspect_ratio] = [img]
+
+    # Initialize batches
+    batches = [[] for _ in range(num_batches)]
+    batch_aspect_counts = [{} for _ in range(num_batches)]  # Track count of each aspect ratio per batch
+
+    # Pre-distribute groups that require duplicates (more images than batches)
+    pre_distributed_images = set()
+
+    for ar, group_images in aspect_groups.items():
+        if len(group_images) > num_batches:
+            # Must distribute duplicates - do it evenly as a hard rule
+            images_per_batch = len(group_images) // num_batches
+            extras = len(group_images) % num_batches
+
+            tqdm.write(f"Pre-distributing {len(group_images)} images with aspect ratio {ar:.3f} "
+                      f"across {num_batches} batches ({images_per_batch}-{images_per_batch + 1} per batch)")
+
+            img_idx = 0
+            for batch_idx in range(num_batches):
+                # Each batch gets base amount, first 'extras' batches get one more
+                count = images_per_batch + (1 if batch_idx < extras else 0)
+                for _ in range(count):
+                    if img_idx < len(group_images):
+                        batches[batch_idx].append(group_images[img_idx])
+                        pre_distributed_images.add(id(group_images[img_idx]))
+                        # Track this aspect ratio in this batch
+                        batch_aspect_counts[batch_idx][ar] = batch_aspect_counts[batch_idx].get(ar, 0) + 1
+                        img_idx += 1
+
+    # Remaining images are those not pre-distributed
+    remaining_images = [img for img in images if id(img) not in pre_distributed_images]
+
+    return batches, remaining_images, batch_aspect_counts
+
+
+def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_per_batch: int,
+                                               tolerance_percent: float, canvas_width: int,
+                                               canvas_height: int, packer_params: dict,
+                                               no_repeats_tolerance: float = 0, allow_repeats: bool = False) -> List[List[ImageInfo]]:
+    """
+    Distribute images with flexible batch sizes to maximize coverage.
+
+    Args:
+        images: List of images to distribute
+        target_per_batch: Target number of images per batch
+        tolerance_percent: Allowed percentage deviation (e.g., 20 = ±20%)
+        canvas_width: Canvas width for testing
+        canvas_height: Canvas height for testing
+        packer_params: Parameters for ImagePacker
+        no_repeats_tolerance: Tolerance percentage for aspect ratio matching (0 = disabled)
+        allow_repeats: If True, allow same image to appear in multiple batches (but not within same batch)
+
+    Returns:
+        List of image batches optimized for maximum coverage
+    """
+    if tolerance_percent <= 0:
+        # No tolerance, use standard distribution
+        num_batches = (len(images) + target_per_batch - 1) // target_per_batch
+        return optimize_image_distribution(images, num_batches, no_repeats_tolerance=no_repeats_tolerance, allow_repeats=allow_repeats)
+
+    # Calculate min/max images per batch
+    tolerance = tolerance_percent / 100.0
+    min_per_batch = max(1, int(target_per_batch * (1 - tolerance)))
+    max_per_batch = int(target_per_batch * (1 + tolerance))
+
+    tqdm.write(f"Split tolerance: {tolerance_percent}% → {min_per_batch}-{max_per_batch} images per canvas")
+
+    # Sort images by area for consistent distribution
+    sorted_images = sorted(images, key=lambda img: img.original_width * img.original_height, reverse=True)
+
+    batches = []
+    remaining_images = sorted_images.copy()
+
+    # Greedy algorithm: for each batch, try different image counts and pick the best coverage
+    with tqdm(desc="Optimizing batch sizes", unit="batch", leave=False) as pbar:
+        while remaining_images:
+            best_batch = None
+            best_coverage = 0
+            best_count = target_per_batch
+
+            # Try different batch sizes within tolerance
+            for batch_size in range(min_per_batch, min(max_per_batch + 1, len(remaining_images) + 1)):
+                # Create test batch
+                if no_repeats_tolerance > 0:
+                    # Build batch while avoiding equivalent aspect ratios WITHIN THIS BATCH
+                    # (same aspect ratio CAN appear in different batches)
+                    test_batch = []
+                    batch_aspects = set()
+                    for img in remaining_images:
+                        img_aspect = img.aspect_ratio
+                        # Only check within this batch, not globally
+                        if not aspect_ratio_in_set(img_aspect, batch_aspects, no_repeats_tolerance):
+                            test_batch.append(img)
+                            batch_aspects.add(img_aspect)
+                            if len(test_batch) == batch_size:
+                                break
+
+                    # If we couldn't get enough unique images, skip this batch size
+                    # But allow smaller batches to enforce the hard rule
+                    if len(test_batch) == 0:
+                        continue
+                else:
+                    test_batch = remaining_images[:batch_size]
+
+                # Quick test: try to pack and measure coverage
+                test_packer = ImagePacker(canvas_width, canvas_height, **packer_params)
+                test_packer.pack(test_batch)
+
+                if test_packer.packed_images:
+                    # Calculate coverage
+                    total_area = sum(p.width * p.height for p in test_packer.packed_images)
+                    canvas_area = canvas_width * canvas_height
+                    coverage = total_area / canvas_area
+
+                    # Prefer higher coverage, but also consider using more images
+                    # Score = coverage + small bonus for using more images (within reason)
+                    score = coverage + (batch_size / target_per_batch) * 0.1
+
+                    if score > best_coverage:
+                        best_coverage = score
+                        best_batch = test_batch
+                        best_count = batch_size
+
+            if best_batch:
+                batches.append(best_batch)
+
+                # Remove used images from remaining pool
+                if no_repeats_tolerance > 0:
+                    remaining_images = [img for img in remaining_images if img not in best_batch]
+                else:
+                    remaining_images = remaining_images[best_count:]
+
+                pbar.set_postfix({'images': len(best_batch), 'coverage': f'{best_coverage*100:.1f}%'})
+                pbar.update(1)
+            else:
+                # Fallback: try to create a batch respecting the constraint even if smaller
+                if no_repeats_tolerance > 0:
+                    # Build fallback batch while avoiding equivalent aspect ratios WITHIN THE BATCH
+                    fallback_batch = []
+                    batch_aspects = set()
+                    for img in remaining_images:
+                        img_aspect = img.aspect_ratio
+                        # Only check within this batch
+                        if not aspect_ratio_in_set(img_aspect, batch_aspects, no_repeats_tolerance):
+                            fallback_batch.append(img)
+                            batch_aspects.add(img_aspect)
+
+                    if fallback_batch:
+                        batches.append(fallback_batch)
+                        remaining_images = [img for img in remaining_images if img not in fallback_batch]
+                        pbar.update(1)
+                    else:
+                        # No more images can be added without violating constraint within a single batch
+                        # This means all remaining images have the same aspect ratio
+                        tqdm.write(f"Warning: {len(remaining_images)} images remaining all have the same aspect ratio - adding to new batches")
+                        # Add each remaining image to its own batch to satisfy constraint
+                        for img in remaining_images:
+                            batches.append([img])
+                        break
+                else:
+                    # No constraint, just take minimum batch size
+                    batch_size = min(min_per_batch, len(remaining_images))
+                    fallback_batch = remaining_images[:batch_size]
+                    batches.append(fallback_batch)
+                    remaining_images = remaining_images[batch_size:]
+                    pbar.update(1)
+
+    batch_sizes = [len(b) for b in batches]
+    tqdm.write(f"Optimized distribution: {batch_sizes} images per canvas")
+
+    return batches
+
+
+def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_repeats_tolerance: float = 0, allow_repeats: bool = False) -> List[List[ImageInfo]]:
+    """
+    Distribute images across multiple batches to maximize coverage.
+
+    Strategy: Alternate distribution by size and aspect ratio for balanced batches.
+    This ensures each collage gets a mix of large/small and wide/tall images.
+
+    Args:
+        images: List of images to distribute
+        num_batches: Number of batches to create
+        no_repeats_tolerance: Tolerance percentage for aspect ratio matching (0 = disabled)
+        allow_repeats: If True, allow same image to appear in multiple batches (but not within same batch)
+
+    Returns:
+        List of image batches optimized for packing
+    """
+    if num_batches == 1:
+        return [images]
+
+    # Pre-distribute forced duplicates if not using allow_repeats
+    # (images with same aspect ratio that exceed batch count)
+    if not allow_repeats:
+        batches, remaining_images, batch_aspect_counts = pre_distribute_forced_duplicates(
+            images, num_batches, no_repeats_tolerance
+        )
+
+        # If no pre-distribution happened, initialize from scratch
+        if batches is None:
+            batches = [[] for _ in range(num_batches)]
+            remaining_images = images
+            batch_aspect_counts = None
+    else:
+        # With allow_repeats, we start fresh and distribute all images first
+        batches = [[] for _ in range(num_batches)]
+        remaining_images = images
+        batch_aspect_counts = None
+        tqdm.write(f"Using allow-repeats mode: will optimize base images first, then add repeats to fill")
+
+    # Sort images by area (largest first)
+    sorted_by_size = sorted(remaining_images,
+                           key=lambda img: img.original_width * img.original_height,
+                           reverse=True)
+
+    # Track which images are in each batch (used for both allow_repeats and tracking)
+    batch_image_sets = [set() for _ in range(num_batches)]
+
+    # Initialize batch_image_sets with pre-distributed images
+    for batch_idx, batch in enumerate(batches):
+        for img in batch:
+            batch_image_sets[batch_idx].add(id(img))
+
+    # Track aspect ratios in each batch if no_repeats_tolerance is enabled
+    if no_repeats_tolerance > 0:
+        # Convert batch_aspect_counts to sets for easier checking
+        batch_aspect_ratios = []
+        for batch, count_dict in zip(batches, batch_aspect_counts if batch_aspect_counts else [{}] * num_batches):
+            ar_set = set(count_dict.keys()) if count_dict else set()
+            # Also add aspect ratios from already allocated images in this batch
+            for img in batch:
+                ar_set.add(img.aspect_ratio)
+            batch_aspect_ratios.append(ar_set)
+    else:
+        batch_aspect_ratios = None
+
+    # FIRST PASS: Distribute each image once (base optimization)
+    for idx, img in enumerate(sorted_by_size):
+        if no_repeats_tolerance > 0:
+            # Find a batch that doesn't already have this aspect ratio (within tolerance)
+            img_aspect = img.aspect_ratio
+            batch_idx = idx % num_batches
+            attempts = 0
+
+            # Try round-robin assignment, avoiding batches with equivalent aspect ratios
+            while attempts < num_batches:
+                if len(batches[batch_idx]) < MAX_IMAGES_PER_BATCH and \
+                   not aspect_ratio_in_set(img_aspect, batch_aspect_ratios[batch_idx], no_repeats_tolerance):
+                    batches[batch_idx].append(img)
+                    batch_aspect_ratios[batch_idx].add(img_aspect)
+                    batch_image_sets[batch_idx].add(id(img))
+                    break
+                batch_idx = (batch_idx + 1) % num_batches
+                attempts += 1
+
+            # HARD RULE: If we couldn't find a batch, create a new one (only if not allow_repeats)
+            if attempts == num_batches and not allow_repeats:
+                # Create a new batch for this image
+                batches.append([img])
+                batch_aspect_ratios.append({img_aspect})
+                batch_image_sets.append({id(img)})
+                num_batches += 1
+                tqdm.write(f"Created additional batch to enforce --no-repeats constraint (aspect ratio {img_aspect:.3f})")
+        else:
+            # No aspect ratio constraints, simple round-robin
+            batch_idx = idx % num_batches
+            if len(batches[batch_idx]) < MAX_IMAGES_PER_BATCH:
+                batches[batch_idx].append(img)
+                batch_image_sets[batch_idx].add(id(img))
+
+
+    # Further optimize by swapping images to balance aspect ratio diversity
+    # Calculate average aspect ratio per batch
+    batch_aspects = []
+    for batch in batches:
+        if batch:
+            avg_aspect = sum(img.aspect_ratio for img in batch) / len(batch)
+            batch_aspects.append(avg_aspect)
+        else:
+            batch_aspects.append(1.0)
+
+    # Ensure each batch has similar total area for even coverage
+    batch_areas = [sum(img.original_width * img.original_height for img in batch) for batch in batches]
+    total_area = sum(batch_areas)
+    target_area_per_batch = total_area / num_batches
+
+    tqdm.write(f"Optimized image distribution: {[len(b) for b in batches]} images per collage")
+    tqdm.write(f"Area balance: {min(batch_areas)/target_area_per_batch*100:.1f}%-{max(batch_areas)/target_area_per_batch*100:.1f}% of target")
+
+    if allow_repeats:
+        tqdm.write(f"Note: Repeats will be added after packing to fill blank areas")
+
+    return batches
+
+
+
+def process_single_collage(args_tuple):
+    """
+    Process a single collage batch. Designed to be called in parallel.
+
+    Args:
+        args_tuple: Tuple of (batch_idx, batch, output_path, canvas_width, canvas_height,
+                             respect_original_size, max_size_variation, overlap_percent,
+                             no_uniformity, randomize, bg_color, save_to_file,
+                             allow_repeats, all_images, no_repeats_tolerance, min_coverage)
+
+    Returns:
+        Dictionary with results, statistics, and optionally the canvas
+    """
+    (batch_idx, batch, output_path, canvas_width, canvas_height,
+     respect_original_size, max_size_variation, overlap_percent, no_uniformity, randomize, bg_color,
+     save_to_file, allow_repeats, all_images, no_repeats_tolerance, min_coverage) = args_tuple
+
+    # Create a new packer instance for this batch
+    packer = ImagePacker(
+        canvas_width,
+        canvas_height,
+        respect_original_size=respect_original_size,
+        max_size_variation=max_size_variation,
+        overlap_percent=overlap_percent,
+        no_uniformity=no_uniformity,
+        randomize=randomize
+    )
+
+    # Pack images
+    packed = packer.pack(batch)
+
+    # Aggressively fill blank areas with repeats if enabled
+    if allow_repeats and all_images:
+        initial_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
+
+        # Determine target coverage: use min_coverage if set, otherwise default to 90%
+        target_coverage = min_coverage if min_coverage else 90.0
+
+        # Determine minimum improvement threshold:
+        # If min_coverage is set, accept ANY improvement (try big images first, small if needed)
+        # Otherwise require meaningful improvement (0.5%)
+        MIN_COVERAGE_IMPROVEMENT = 0.0 if min_coverage else 0.5
+
+        if initial_coverage < target_coverage:  # Only try to fill if below target
+            # Track which images are already used in this collage
+            used_image_ids = {id(img) for img in batch}
+
+            # Track aspect ratios if no_repeats_tolerance is enabled
+            if no_repeats_tolerance > 0:
+                used_aspects = {img.aspect_ratio for img in batch}
+
+            # Sort all images by size (largest first for better coverage)
+            candidates = sorted(all_images,
+                               key=lambda img: img.original_width * img.original_height,
+                               reverse=True)
+
+            # Keep trying to add images until we can't add any more
+            added_count = 0
+
+            for candidate in candidates:
+                # Stop if we've hit safety limit
+                if len(batch) >= MAX_IMAGES_PER_BATCH:
+                    break
+
+                # Stop if we've achieved target coverage
+                current_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
+                if current_coverage >= target_coverage:
+                    break
+
+                # Skip if already used in this collage
+                if id(candidate) in used_image_ids:
+                    continue
+
+                # Check no_repeats constraint (aspect ratio)
+                if no_repeats_tolerance > 0:
+                    if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
+                        continue
+
+                # Try to pack this image with a FRESH packer instance
+                test_batch = batch + [candidate]
+                test_packer = ImagePacker(
+                    canvas_width,
+                    canvas_height,
+                    respect_original_size=respect_original_size,
+                    max_size_variation=max_size_variation,
+                    overlap_percent=overlap_percent,
+                    no_uniformity=no_uniformity,
+                    randomize=randomize
+                )
+                test_packed = test_packer.pack(test_batch)
+
+                # Check if it packed successfully AND improves coverage meaningfully
+                if len(test_packed) > len(packed):
+                    new_coverage = sum(p.width * p.height for p in test_packed) / (canvas_width * canvas_height) * 100
+                    coverage_improvement = new_coverage - current_coverage
+
+                    # Only accept if coverage improves by at least MIN_COVERAGE_IMPROVEMENT
+                    if coverage_improvement >= MIN_COVERAGE_IMPROVEMENT:
+                        packed = test_packed
+                        batch = test_batch
+                        used_image_ids.add(id(candidate))
+                        if no_repeats_tolerance > 0:
+                            used_aspects.add(candidate.aspect_ratio)
+                        added_count += 1
+
+                        # Update packer to use the successful pack
+                        packer = test_packer
+
+            if added_count > 0:
+                final_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
+                tqdm.write(f"Collage {batch_idx}: Added {added_count} repeat images to fill blanks "
+                          f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
+
+
+    # Create collage
+    collage = packer.create_collage(background_color=bg_color)
+
+    # Save or keep in memory
+    if save_to_file:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        collage.save(output_path, quality=95)
+
+    # Calculate statistics
+    total_image_area = sum(p.width * p.height for p in packed)
+    canvas_area = canvas_width * canvas_height
+    coverage = (total_image_area / canvas_area) * 100
+
+    stats = {
+        'batch_idx': batch_idx,
+        'output_path': output_path,
+        'num_images': len(batch),
+        'num_packed': len(packed),
+        'coverage': coverage,
+    }
+
+    # Area uniformity statistics
+    if packed and not respect_original_size:
+        areas = [p.width * p.height for p in packed]
+        avg_area = sum(areas) / len(areas)
+        max_area_diff = max(abs(area - avg_area) / avg_area * 100 for area in areas)
+        min_area = min(areas)
+        max_area = max(areas)
+
+        stats.update({
+            'avg_area': avg_area,
+            'min_area': min_area,
+            'max_area': max_area,
+            'max_area_deviation': max_area_diff,
+        })
+
+        # Aspect ratio preservation
+        max_aspect_error = 0.0
+        for p in packed:
+            actual_aspect = p.width / p.height
+            original_aspect = p.info.aspect_ratio
+            aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
+            max_aspect_error = max(max_aspect_error, aspect_error)
+        stats['max_aspect_error'] = max_aspect_error
+
+        # Overlap statistics
+        max_overlap_percent = 0.0
+        for i, p in enumerate(packed):
+            p_area = p.width * p.height
+            for j, other in enumerate(packed):
+                if i == j:
+                    continue
+                overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
+                overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
+                if overlap_x > 0 and overlap_y > 0:
+                    overlap_area = overlap_x * overlap_y
+                    overlap_percent = (overlap_area / p_area) * 100
+                    max_overlap_percent = max(max_overlap_percent, overlap_percent)
+        stats['max_overlap'] = max_overlap_percent
+
+    # Include canvas if not saving to file (for PDF generation)
+    if not save_to_file:
+        stats['canvas'] = collage
+
+    return stats
+
+
+def print_collage_stats(stats, total_batches):
+    """Print statistics for a completed collage."""
+    print(f"\n{'='*60}")
+    print(f"Collage {stats['batch_idx']}/{total_batches}: {stats['num_images']} images -> {stats['output_path']}")
+    print(f"{'='*60}")
+
+    if stats['num_packed'] < stats['num_images']:
+        print(f"Warning: Could only pack {stats['num_packed']} out of {stats['num_images']} images.")
+        print("Try increasing canvas size or enabling --respect-original-size")
+
+    print(f"Collage saved to {stats['output_path']}")
+    print(f"Canvas coverage: {stats['coverage']:.1f}%")
+
+    if 'avg_area' in stats:
+        print(f"Area uniformity - Average area: {stats['avg_area']:.0f}, "
+              f"Min: {stats['min_area']:.0f}, Max: {stats['max_area']:.0f}")
+        print(f"Area uniformity - Max deviation from average: {stats['max_area_deviation']:.2f}%")
+        print(f"Aspect ratio preservation - Max deviation: {stats['max_aspect_error']:.2f}%")
+        print(f"Image overlap - Max overlap: {stats['max_overlap']:.2f}% of any image's area")
+
+
+def save_canvases_to_pdf(canvases: List, output_path: str):
+    """
+    Save multiple canvases (PIL Images) to a single PDF file.
+
+    Args:
+        canvases: List of PIL Image objects (one per page)
+        output_path: Path to save the PDF file
+    """
+    if not canvases:
+        print("Error: No canvases to save to PDF")
+        return
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+
+    # Convert all images to RGB mode (PDF requires RGB)
+    rgb_canvases = []
+    for canvas in canvases:
+        if canvas.mode != 'RGB':
+            rgb_canvases.append(canvas.convert('RGB'))
+        else:
+            rgb_canvases.append(canvas)
+
+    # Save first image with remaining images as additional pages
+    if len(rgb_canvases) == 1:
+        rgb_canvases[0].save(output_path, 'PDF', quality=95)
+    else:
+        rgb_canvases[0].save(
+            output_path,
+            'PDF',
+            save_all=True,
+            append_images=rgb_canvases[1:],
+            quality=95
+        )
+
+    print(f"\nPDF saved with {len(canvases)} page(s) to {output_path}")
+
+
+def optimize_canvas_count_for_coverage(images: List[ImageInfo], target_images_per_canvas: int,
+                                       canvas_width: int, canvas_height: int,
+                                       packer_params: dict, no_repeats_tolerance: float) -> tuple:
+    """
+    Determine optimal number of canvases to maximize average coverage.
+
+    Tests different canvas counts around a target images-per-canvas value,
+    running quick packing tests to find the configuration with best coverage.
+
+    Args:
+        images: List of images to distribute
+        target_images_per_canvas: Target images per canvas (tests configurations around this)
+        canvas_width: Canvas width
+        canvas_height: Canvas height
+        packer_params: Parameters for ImagePacker
+        no_repeats_tolerance: Tolerance for no-repeats constraint
+
+    Returns:
+        Tuple of (optimal_num_canvases, optimal_images_per_canvas, best_coverage)
+    """
+    total_images = len(images)
+
+    # Calculate ideal canvas count based on target
+    ideal_canvases = max(1, round(total_images / target_images_per_canvas))
+
+    # Test a tight range around the ideal (80% to 120% of ideal)
+    # This is aggressive to stay close to target, especially important with --allow-repeats
+    min_canvases = max(1, int(ideal_canvases * 0.8))
+    max_canvases = min(total_images, int(ideal_canvases * 1.2))
+
+    # Ensure reasonable bounds
+    if max_canvases < min_canvases:
+        max_canvases = min_canvases
+
+    total_configs = max_canvases - min_canvases + 1
+
+    print(f"\nOptimizing canvas count for maximum coverage...")
+    print(f"Target: ~{target_images_per_canvas} images per canvas")
+    print(f"Ideal canvas count: {ideal_canvases} (testing range: {min_canvases}-{max_canvases})")
+
+    best_config = None
+    best_avg_coverage = 0
+    results = []
+
+    # Try different numbers of canvases
+    with tqdm(desc="Testing configurations", total=total_configs, unit="config") as pbar:
+        for num_canvases in range(min_canvases, max_canvases + 1):
+            images_per_canvas = total_images // num_canvases
+
+            # Distribute images for this configuration
+            if no_repeats_tolerance > 0:
+                test_batches, _, _ = pre_distribute_forced_duplicates(images, num_canvases, no_repeats_tolerance)
+                if test_batches is None:
+                    test_batches = [[] for _ in range(num_canvases)]
+                # Simple round-robin for remaining to get quick estimate
+                remaining = [img for img in images if not any(img in batch for batch in test_batches)]
+                for idx, img in enumerate(remaining):
+                    test_batches[idx % num_canvases].append(img)
+            else:
+                # Simple round-robin distribution
+                test_batches = [[] for _ in range(num_canvases)]
+                for idx, img in enumerate(images):
+                    test_batches[idx % num_canvases].append(img)
+
+            # Quick packing test on each batch
+            coverages = []
+            for batch in test_batches:
+                if not batch:
+                    continue
+                test_packer = ImagePacker(canvas_width, canvas_height, **packer_params)
+                test_packer.pack(batch)
+
+                if test_packer.packed_images:
+                    total_area = sum(p.width * p.height for p in test_packer.packed_images)
+                    canvas_area = canvas_width * canvas_height
+                    coverage = (total_area / canvas_area) * 100
+                    coverages.append(coverage)
+
+            if coverages:
+                avg_coverage = sum(coverages) / len(coverages)
+                min_coverage = min(coverages)
+                max_coverage = max(coverages)
+
+                results.append({
+                    'num_canvases': num_canvases,
+                    'images_per_canvas': images_per_canvas,
+                    'avg_coverage': avg_coverage,
+                    'min_coverage': min_coverage,
+                    'max_coverage': max_coverage
+                })
+
+                if avg_coverage > best_avg_coverage:
+                    best_avg_coverage = avg_coverage
+                    best_config = (num_canvases, images_per_canvas)
+
+                pbar.set_postfix({
+                    'canvases': num_canvases,
+                    'per_canvas': images_per_canvas,
+                    'avg_cov': f'{avg_coverage:.1f}%'
+                })
+
+            pbar.update(1)
+
+    # Display results
+    print(f"\n{'='*80}")
+    print(f"Coverage optimization results:")
+    print(f"{'='*80}")
+    print(f"{'Canvases':<10} {'Images/Canvas':<15} {'Avg Coverage':<15} {'Min Coverage':<15} {'Max Coverage':<15}")
+    print(f"{'-'*80}")
+
+    for result in sorted(results, key=lambda x: x['avg_coverage'], reverse=True)[:10]:
+        marker = " <-- BEST" if (result['num_canvases'], result['images_per_canvas']) == best_config else ""
+        print(f"{result['num_canvases']:<10} {result['images_per_canvas']:<15} "
+              f"{result['avg_coverage']:<15.1f} {result['min_coverage']:<15.1f} "
+              f"{result['max_coverage']:<15.1f}{marker}")
+
+    if best_config:
+        print(f"{'='*80}")
+        print(f"Selected: {best_config[0]} canvases with ~{best_config[1]} images each")
+        print(f"Average coverage: {best_avg_coverage:.1f}%")
+        print(f"{'='*80}\n")
+        return best_config[0], best_config[1], best_avg_coverage
+    else:
+        # Fallback to single canvas
+        return 1, total_images, 0.0
 
 
 def main():
@@ -717,6 +1572,11 @@ def main():
         help='Output file path (default: output_images/collage.png)'
     )
     parser.add_argument(
+        '--pdf',
+        action='store_true',
+        help='Save all collages as a single PDF file (one collage per page)'
+    )
+    parser.add_argument(
         '--respect-original-size',
         action='store_true',
         help='Respect original image sizes and proportions (default: make all images roughly equal in size)'
@@ -725,7 +1585,7 @@ def main():
         '--max-size-variation',
         type=float,
         default=15.0,
-        help='Maximum percentage that any width/height can differ from average width/height (default: 15.0)'
+        help='Maximum percentage that any image area can differ from average area (default: 15.0)'
     )
     parser.add_argument(
         '--overlap-percent',
@@ -738,8 +1598,102 @@ def main():
         default='255,255,255',
         help='Background color as R,G,B (default: 255,255,255 for white)'
     )
+    parser.add_argument(
+        '--no-uniformity',
+        action='store_true',
+        help='Skip area uniformity enforcement to maximize coverage (images may vary more in size)'
+    )
+    parser.add_argument(
+        '--randomize',
+        action='store_true',
+        help='Randomize image order (default: sort by size for better packing)'
+    )
+    parser.add_argument(
+        '--no-repeats',
+        type=float,
+        default=0,
+        metavar='TOLERANCE',
+        help='Prevent images with similar aspect ratios from appearing in the same collage. '
+             'Value is tolerance percentage (e.g., 5 means aspect ratios within 5%% are considered the same). '
+             'Use 0 for exact matching (default: 0 = disabled)'
+    )
+    parser.add_argument(
+        '--allow-repeats',
+        action='store_true',
+        help='Allow the same image to appear in multiple canvases (but never twice in the same canvas). '
+             'After initial packing, fills blank areas with repeated images. Use with --min-coverage to set target.'
+    )
+    parser.add_argument(
+        '--min-coverage',
+        type=float,
+        metavar='PERCENT',
+        help='Minimum coverage percentage to achieve by adding repeated images (e.g., 90 for 90%%). '
+             'Only works with --allow-repeats. Adds images from largest to smallest until target is reached.'
+    )
+    parser.add_argument(
+        '-n', '--images-per-collage',
+        type=int,
+        help='Number of images per collage (creates multiple collages if needed)'
+    )
+    parser.add_argument(
+        '-p', '--num-collages',
+        type=int,
+        help='Number of collages to create (divides images evenly)'
+    )
+    parser.add_argument(
+        '--split-tolerance',
+        type=float,
+        default=0,
+        help='Percentage flexibility in images per canvas to maximize coverage (e.g., 20 allows ±20%% from target)'
+    )
+    parser.add_argument(
+        '--max-coverage',
+        type=int,
+        metavar='TARGET_IMAGES',
+        help='Automatically determine optimal number of canvases to maximize coverage. '
+             'Value is target images per canvas (e.g., 8 means aim for ~8 images per canvas). '
+             'Will test different canvas counts around this target and pick the one with best coverage.'
+    )
+    parser.add_argument(
+        '-j', '--jobs',
+        type=int,
+        default=None,
+        help=f'Number of parallel jobs for creating collages (default: auto-detect, max: {cpu_count()})'
+    )
 
     args = parser.parse_args()
+
+    # Validate flags
+    if sum([bool(args.images_per_collage), bool(args.num_collages), bool(args.max_coverage)]) > 1:
+        print("Error: Can only specify one of -n/--images-per-collage, -p/--num-collages, or --max-coverage")
+        return 1
+
+    if args.max_coverage and args.max_coverage < 1:
+        print("Error: --max-coverage target images per canvas must be at least 1")
+        return 1
+
+    if args.split_tolerance < 0 or args.split_tolerance > 100:
+        print("Error: --split-tolerance must be between 0 and 100")
+        return 1
+
+    if args.no_repeats < 0 or args.no_repeats > 100:
+        print("Error: --no-repeats tolerance must be between 0 and 100")
+        return 1
+
+    if args.min_coverage:
+        if not args.allow_repeats:
+            print("Error: --min-coverage requires --allow-repeats flag")
+            return 1
+        if args.min_coverage < 0 or args.min_coverage > 100:
+            print("Error: --min-coverage must be between 0 and 100")
+            return 1
+
+    if args.split_tolerance > 0 and not (args.images_per_collage or args.num_collages):
+        print("Warning: --split-tolerance requires -n or -p flag to have effect")
+
+    if args.no_repeats > 0 and not (args.images_per_collage or args.num_collages):
+        print("Warning: --no-repeats requires -n or -p flag to have effect (does nothing for single collage)")
+
 
     # Parse background color
     try:
@@ -756,7 +1710,9 @@ def main():
         args.height,
         respect_original_size=args.respect_original_size,
         max_size_variation=args.max_size_variation,
-        overlap_percent=args.overlap_percent
+        overlap_percent=args.overlap_percent,
+        no_uniformity=args.no_uniformity,
+        randomize=args.randomize
     )
 
     # Load images
@@ -773,59 +1729,325 @@ def main():
 
     print(f"Found {len(images)} images.")
 
-    # Pack images
-    print("Packing images...")
-    packed = packer.pack(images)
+    # Determine batching strategy with optimized distribution
+    image_batches = []
+    if args.images_per_collage:
+        # Create batches with flexible sizes using split-tolerance
+        if args.split_tolerance > 0:
+            # Use tolerance-based distribution for maximum coverage
+            packer_params = {
+                'respect_original_size': args.respect_original_size,
+                'max_size_variation': args.max_size_variation,
+                'overlap_percent': args.overlap_percent,
+                'no_uniformity': args.no_uniformity,
+                'randomize': args.randomize
+            }
+            image_batches = optimize_image_distribution_with_tolerance(
+                images, args.images_per_collage, args.split_tolerance,
+                args.width, args.height, packer_params, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats
+            )
+            print(f"Creating {len(image_batches)} collage(s) with flexible sizing (±{args.split_tolerance}%)")
+        else:
+            # Standard fixed-size distribution
+            num_collages = (len(images) + args.images_per_collage - 1) // args.images_per_collage
+            image_batches = optimize_image_distribution(images, num_collages, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats)
+            print(f"Creating {len(image_batches)} collage(s) with optimized image distribution")
+    elif args.num_collages:
+        # Divide images evenly into P collages with optimized distribution
+        num_collages = args.num_collages
+        if num_collages > len(images):
+            print(f"Warning: Requested {num_collages} collages but only {len(images)} images available")
+            num_collages = len(images)
 
-    if not packed or len(packed) < len(images):
-        print(f"Warning: Could only pack {len(packed)} out of {len(images)} images.")
-        print("Try increasing canvas size or enabling --respect-original-size")
+        if args.split_tolerance > 0:
+            # Calculate target per collage and use tolerance-based distribution
+            target_per_collage = len(images) // num_collages
+            packer_params = {
+                'respect_original_size': args.respect_original_size,
+                'max_size_variation': args.max_size_variation,
+                'overlap_percent': args.overlap_percent,
+                'no_uniformity': args.no_uniformity,
+                'randomize': args.randomize
+            }
+            image_batches = optimize_image_distribution_with_tolerance(
+                images, target_per_collage, args.split_tolerance,
+                args.width, args.height, packer_params, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats
+            )
+            # Adjust if we created more/fewer batches than requested
+            if len(image_batches) != num_collages:
+                print(f"Note: Created {len(image_batches)} collages (target was {num_collages}) for optimal coverage")
+            else:
+                print(f"Creating {num_collages} collage(s) with flexible sizing (±{args.split_tolerance}%)")
+        else:
+            # Standard fixed-size distribution
+            image_batches = optimize_image_distribution(images, num_collages, no_repeats_tolerance=args.no_repeats, allow_repeats=args.allow_repeats)
+            print(f"Creating {num_collages} collage(s) with optimized image distribution")
+    elif args.max_coverage:
+        # Optimize canvas count for maximum coverage
+        packer_params = {
+            'respect_original_size': args.respect_original_size,
+            'max_size_variation': args.max_size_variation,
+            'overlap_percent': args.overlap_percent,
+            'no_uniformity': args.no_uniformity,
+            'randomize': args.randomize
+        }
+        optimal_canvases, optimal_per_canvas, avg_coverage = optimize_canvas_count_for_coverage(
+            images, args.max_coverage, args.width, args.height, packer_params, args.no_repeats
+        )
 
-    # Create collage
-    print("Creating collage...")
-    collage = packer.create_collage(background_color=bg_color)
+        # Select base images for distribution: target_per_canvas * num_canvases
+        # Use optimal_per_canvas from the optimization (not all images)
+        target_total_images = optimal_canvases * args.max_coverage
 
-    # Save
-    collage.save(args.output, quality=95)
-    print(f"Collage saved to {args.output}")
+        # Select the best images for base distribution (largest first for better coverage)
+        base_images = sorted(images,
+                            key=lambda img: img.original_width * img.original_height,
+                            reverse=True)[:target_total_images]
 
-    # Print statistics
-    total_image_area = sum(p.width * p.height for p in packed)
-    canvas_area = args.width * args.height
-    coverage = (total_image_area / canvas_area) * 100
-    print(f"Canvas coverage: {coverage:.1f}%")
+        print(f"Base distribution: {len(base_images)} images across {optimal_canvases} canvases (~{len(base_images)//optimal_canvases} per canvas)")
 
-    # Print size uniformity statistics
-    if packed and not args.respect_original_size:
-        avg_width = sum(p.width for p in packed) / len(packed)
-        avg_height = sum(p.height for p in packed) / len(packed)
-        max_width_diff = max(abs(p.width - avg_width) / avg_width * 100 for p in packed)
-        max_height_diff = max(abs(p.height - avg_height) / avg_height * 100 for p in packed)
-        print(f"Size uniformity - Max width deviation: {max_width_diff:.2f}%, Max height deviation: {max_height_diff:.2f}%")
+        # Distribute ONLY the base images (not all images)
+        image_batches = optimize_image_distribution(base_images, optimal_canvases, no_repeats_tolerance=args.no_repeats, allow_repeats=False)
+        print(f"Creating {len(image_batches)} collage(s) with optimized distribution for maximum coverage")
+        if args.allow_repeats:
+            print(f"Note: Repeats will be added after collage creation to fill blank areas (from full pool of {len(images)} images)")
+    else:
+        # Single collage with all images
+        image_batches = [images]
 
-        # Check aspect ratio preservation
-        max_aspect_error = 0.0
-        for p in packed:
-            actual_aspect = p.width / p.height
-            original_aspect = p.info.aspect_ratio
-            aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
-            max_aspect_error = max(max_aspect_error, aspect_error)
-        print(f"Aspect ratio preservation - Max deviation: {max_aspect_error:.2f}%")
+    # Generate output filenames
+    output_files = []
+    if len(image_batches) > 1:
+        # Multiple collages - generate numbered filenames
+        output_dir = os.path.dirname(args.output) or '.'
+        output_base = os.path.basename(args.output)
+        output_name, output_ext = os.path.splitext(output_base)
 
-        # Check overlap statistics
-        max_overlap_percent = 0.0
-        for i, p in enumerate(packed):
-            p_area = p.width * p.height
-            for j, other in enumerate(packed):
-                if i == j:
-                    continue
-                overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
-                overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
-                if overlap_x > 0 and overlap_y > 0:
-                    overlap_area = overlap_x * overlap_y
-                    overlap_percent = (overlap_area / p_area) * 100
-                    max_overlap_percent = max(max_overlap_percent, overlap_percent)
-        print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
+        for i in range(len(image_batches)):
+            numbered_filename = f"{output_name}_{i+1:03d}{output_ext}"
+            output_files.append(os.path.join(output_dir, numbered_filename))
+    else:
+        output_files = [args.output]
+
+    # Determine number of parallel jobs
+    num_jobs = args.jobs if args.jobs else min(cpu_count(), len(image_batches))
+    if num_jobs > len(image_batches):
+        num_jobs = len(image_batches)
+
+    # Create collages
+    if len(image_batches) > 1 and num_jobs > 1:
+        # Parallel processing for multiple collages
+        print(f"\nProcessing {len(image_batches)} collages using {num_jobs} parallel workers...")
+
+        # Prepare arguments for parallel processing
+        job_args = []
+        for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
+            job_args.append((
+                batch_idx,
+                batch,
+                output_path,
+                args.width,
+                args.height,
+                args.respect_original_size,
+                args.max_size_variation,
+                args.overlap_percent,
+                args.no_uniformity,
+                args.randomize,
+                bg_color,
+                not args.pdf,  # save_to_file: False when creating PDF
+                args.allow_repeats,  # allow_repeats
+                images,  # all_images: full image pool for repeat filling
+                args.no_repeats,  # no_repeats_tolerance
+                args.min_coverage  # min_coverage
+            ))
+
+        # Process in parallel with progress bar
+        with Pool(processes=num_jobs) as pool:
+            results = list(tqdm(
+                pool.imap(process_single_collage, job_args),
+                total=len(job_args),
+                desc="Creating collages",
+                unit="collage"
+            ))
+
+        # Print statistics for all collages
+        results.sort(key=lambda x: x['batch_idx'])
+        for stats in results:
+            print_collage_stats(stats, len(image_batches))
+
+        # If PDF mode, save all canvases to a single PDF
+        if args.pdf:
+            canvases = [result['canvas'] for result in results]
+            # Change output extension to .pdf
+            pdf_output = os.path.splitext(args.output)[0] + '.pdf'
+            save_canvases_to_pdf(canvases, pdf_output)
+
+    else:
+        # Sequential processing (single collage or single job)
+        if len(image_batches) == 1:
+            print("\nCreating single collage...")
+        else:
+            print(f"\nCreating {len(image_batches)} collages sequentially...")
+
+        canvases = []  # For PDF mode
+        for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
+            print(f"\n{'='*60}")
+            print(f"Collage {batch_idx}/{len(image_batches)}: {len(batch)} images -> {output_path}")
+            print(f"{'='*60}")
+
+            # Pack images
+            print("Packing images...")
+            packed = packer.pack(batch)
+
+            # Aggressively fill blank areas with repeats if enabled
+            if args.allow_repeats:
+                initial_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+
+                # Determine target coverage: use min_coverage if set, otherwise default to 90%
+                target_coverage = args.min_coverage if args.min_coverage else 90.0
+
+                # Determine minimum improvement threshold:
+                # If min_coverage is set, accept ANY improvement (try big images first, small if needed)
+                # Otherwise require meaningful improvement (0.5%)
+                MIN_COVERAGE_IMPROVEMENT = 0.0 if args.min_coverage else 0.5
+
+                if initial_coverage < target_coverage:  # Only try to fill if below target
+                    print(f"Filling blank areas with repeats (initial coverage: {initial_coverage:.1f}%, target: {target_coverage:.1f}%)...")
+
+                    # Track which images are already used in this collage
+                    used_image_ids = {id(img) for img in batch}
+
+                    # Track aspect ratios if no_repeats_tolerance is enabled
+                    if args.no_repeats > 0:
+                        used_aspects = {img.aspect_ratio for img in batch}
+
+                    # Sort all images by size (largest first for better coverage)
+                    candidates = sorted(images,
+                                       key=lambda img: img.original_width * img.original_height,
+                                       reverse=True)
+
+                    # Keep trying to add images until we can't add any more
+                    added_count = 0
+
+                    for candidate in candidates:
+                        # Stop if we've hit safety limit
+                        if len(batch) >= MAX_IMAGES_PER_BATCH:
+                            break
+
+                        # Stop if we've achieved target coverage
+                        current_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+                        if current_coverage >= target_coverage:
+                            break
+
+                        # Skip if already used in this collage
+                        if id(candidate) in used_image_ids:
+                            continue
+
+                        # Check no_repeats constraint (aspect ratio)
+                        if args.no_repeats > 0:
+                            if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, args.no_repeats):
+                                continue
+
+                        # Try to pack this image with a FRESH packer instance
+                        test_batch = batch + [candidate]
+                        test_packer = ImagePacker(
+                            args.width,
+                            args.height,
+                            respect_original_size=args.respect_original_size,
+                            max_size_variation=args.max_size_variation,
+                            overlap_percent=args.overlap_percent,
+                            no_uniformity=args.no_uniformity,
+                            randomize=args.randomize
+                        )
+                        test_packed = test_packer.pack(test_batch)
+
+                        # Check if it packed successfully AND improves coverage meaningfully
+                        if len(test_packed) > len(packed):
+                            new_coverage = sum(p.width * p.height for p in test_packed) / (args.width * args.height) * 100
+                            coverage_improvement = new_coverage - current_coverage
+
+                            # Only accept if coverage improves by at least MIN_COVERAGE_IMPROVEMENT
+                            if coverage_improvement >= MIN_COVERAGE_IMPROVEMENT:
+                                packed = test_packed
+                                batch = test_batch
+                                used_image_ids.add(id(candidate))
+                                if args.no_repeats > 0:
+                                    used_aspects.add(candidate.aspect_ratio)
+                                added_count += 1
+
+                                # Update packer to use the successful pack
+                                packer = test_packer
+
+                    if added_count > 0:
+                        final_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+                        print(f"Added {added_count} repeat images to fill blanks "
+                              f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
+
+
+            if not packed or len(packed) < len(batch):
+                print(f"Warning: Could only pack {len(packed)} out of {len(batch)} images.")
+                print("Try increasing canvas size or enabling --respect-original-size")
+
+            # Create collage
+            print("Creating collage...")
+            collage = packer.create_collage(background_color=bg_color)
+
+            # Save or collect for PDF
+            if args.pdf:
+                canvases.append(collage)
+            else:
+                os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+                collage.save(output_path, quality=95)
+                print(f"Collage saved to {output_path}")
+
+            # Print statistics
+            total_image_area = sum(p.width * p.height for p in packed)
+            canvas_area = args.width * args.height
+            coverage = (total_image_area / canvas_area) * 100
+            print(f"Canvas coverage: {coverage:.1f}%")
+
+            # Print area uniformity statistics
+            if packed and not args.respect_original_size:
+                areas = [p.width * p.height for p in packed]
+                avg_area = sum(areas) / len(areas)
+                max_area_diff = max(abs(area - avg_area) / avg_area * 100 for area in areas)
+                min_area = min(areas)
+                max_area = max(areas)
+                print(f"Area uniformity - Average area: {avg_area:.0f}, Min: {min_area:.0f}, Max: {max_area:.0f}")
+                print(f"Area uniformity - Max deviation from average: {max_area_diff:.2f}%")
+
+                # Check aspect ratio preservation
+                max_aspect_error = 0.0
+                for p in packed:
+                    actual_aspect = p.width / p.height
+                    original_aspect = p.info.aspect_ratio
+                    aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
+                    max_aspect_error = max(max_aspect_error, aspect_error)
+                print(f"Aspect ratio preservation - Max deviation: {max_aspect_error:.2f}%")
+
+                # Check overlap statistics
+                max_overlap_percent = 0.0
+                for i, p in enumerate(packed):
+                    p_area = p.width * p.height
+                    for j, other in enumerate(packed):
+                        if i == j:
+                            continue
+                        overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
+                        overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
+                        if overlap_x > 0 and overlap_y > 0:
+                            overlap_area = overlap_x * overlap_y
+                            overlap_percent = (overlap_area / p_area) * 100
+                            max_overlap_percent = max(max_overlap_percent, overlap_percent)
+                print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
+
+        # If PDF mode in sequential processing, save all canvases to a single PDF
+        if args.pdf and canvases:
+            pdf_output = os.path.splitext(args.output)[0] + '.pdf'
+            save_canvases_to_pdf(canvases, pdf_output)
+
+    print(f"\n{'='*60}")
+    print(f"✓ Created {len(image_batches)} collage(s) successfully")
+    print(f"{'='*60}")
 
     return 0
 
