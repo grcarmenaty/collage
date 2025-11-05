@@ -795,13 +795,18 @@ class ImagePacker:
                     if rect_area < 1:
                         continue
 
-                    # Try to fit an image into this rectangle
+                    # TWO-PASS APPROACH: Try unused images first, then used images
+                    # This ensures big gaps get filled with fresh images before repeating
                     best_candidate = None
                     best_fit_area = 0
 
+                    # PASS 1: Try UNUSED images first (prioritize filling with new images)
                     for candidate in candidate_images:
-                        # NO RESTRICTION on used_image_ids - allow unlimited repeats!
-                        # Only check aspect ratio constraint if specified
+                        # Skip if already used - we want fresh images first
+                        if id(candidate) in used_image_ids:
+                            continue
+
+                        # Check aspect ratio constraint if specified
                         if used_aspects is not None and no_repeats_tolerance > 0:
                             if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
                                 continue
@@ -836,11 +841,48 @@ class ImagePacker:
                             # Prefer images that fill more of the rectangle
                             if fit_area > best_fit_area:
                                 best_fit_area = fit_area
-                                best_candidate = (candidate, fit_width, fit_height)
+                                best_candidate = (candidate, fit_width, fit_height, False)  # False = not a repeat
 
-                    # NO THRESHOLD - place ANY image that fits, no matter how poorly
+                    # PASS 2: If no unused image fits, try USED images (allow repeats)
+                    if not best_candidate:
+                        for candidate in candidate_images:
+                            # Now we allow already-used images
+                            # Still check aspect ratio constraint
+                            if used_aspects is not None and no_repeats_tolerance > 0:
+                                if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
+                                    continue
+
+                            # Calculate how large we can make this image in this rectangle
+                            aspect = candidate.aspect_ratio
+
+                            # Try to fill the rectangle while maintaining aspect ratio
+                            if free_rect.width / free_rect.height > aspect:
+                                fit_height = free_rect.height
+                                fit_width = int(fit_height * aspect)
+                            else:
+                                fit_width = free_rect.width
+                                fit_height = int(fit_width / aspect)
+
+                            # Ensure it fits
+                            if fit_width > free_rect.width or fit_height > free_rect.height:
+                                continue
+
+                            if fit_width < 1 or fit_height < 1:
+                                continue
+
+                            fit_area = fit_width * fit_height
+
+                            # Check if this placement is valid
+                            if self._check_space_available_with_overlap(
+                                free_rect.x, free_rect.y, fit_width, fit_height, -1
+                            ):
+                                if fit_area > best_fit_area:
+                                    best_fit_area = fit_area
+                                    best_candidate = (candidate, fit_width, fit_height, True)  # True = is a repeat
+
+                    # Place the best candidate if found
                     if best_candidate:
-                        candidate, fit_width, fit_height = best_candidate
+                        candidate, fit_width, fit_height, is_repeat = best_candidate
 
                         # Add the image
                         self.packed_images.append(PackedImage(
@@ -850,6 +892,9 @@ class ImagePacker:
                             width=fit_width,
                             height=fit_height
                         ))
+
+                        # Track usage (even for repeats, to know what we've used)
+                        used_image_ids.add(id(candidate))
 
                         iteration_added += 1
 
