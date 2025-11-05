@@ -1059,6 +1059,52 @@ class ImagePacker:
         return canvas
 
 
+def merge_single_image_batches(batches: List[List[ImageInfo]]) -> List[List[ImageInfo]]:
+    """
+    Merge any batches with only 1 image into adjacent batches.
+    Never allow a collage with just a single image.
+
+    Args:
+        batches: List of image batches
+
+    Returns:
+        List of batches with no single-image batches
+    """
+    if len(batches) <= 1:
+        return batches
+
+    # Keep merging until no single-image batches remain
+    while True:
+        # Find first single-image batch
+        single_idx = None
+        for i, batch in enumerate(batches):
+            if len(batch) == 1:
+                single_idx = i
+                break
+
+        # If no single-image batches, we're done
+        if single_idx is None:
+            break
+
+        # Merge with adjacent batch (prefer next, fallback to previous)
+        if single_idx < len(batches) - 1:
+            # Merge with next batch
+            batches[single_idx + 1].extend(batches[single_idx])
+            batches.pop(single_idx)
+            tqdm.write(f"Merged single-image batch {single_idx + 1} into batch {single_idx + 2}")
+        elif single_idx > 0:
+            # Merge with previous batch
+            batches[single_idx - 1].extend(batches[single_idx])
+            batches.pop(single_idx)
+            tqdm.write(f"Merged single-image batch {single_idx + 1} into batch {single_idx}")
+        else:
+            # Only one batch with one image - can't merge
+            tqdm.write(f"Warning: Only 1 image available, cannot create multiple collages")
+            break
+
+    return batches
+
+
 def aspect_ratios_are_equivalent(ar1: float, ar2: float, tolerance_percent: float) -> bool:
     """
     Check if two aspect ratios are within the specified tolerance percentage.
@@ -1297,6 +1343,9 @@ def optimize_image_distribution_with_tolerance(images: List[ImageInfo], target_p
                     remaining_images = remaining_images[batch_size:]
                     pbar.update(1)
 
+    # Ensure no single-image batches
+    batches = merge_single_image_batches(batches)
+
     batch_sizes = [len(b) for b in batches]
     tqdm.write(f"Optimized distribution: {batch_sizes} images per canvas")
 
@@ -1417,8 +1466,17 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
     total_area = sum(batch_areas)
     target_area_per_batch = total_area / num_batches
 
+    # Ensure no single-image batches
+    batches = merge_single_image_batches(batches)
+
     tqdm.write(f"Optimized image distribution: {[len(b) for b in batches]} images per collage")
-    tqdm.write(f"Area balance: {min(batch_areas)/target_area_per_batch*100:.1f}%-{max(batch_areas)/target_area_per_batch*100:.1f}% of target")
+
+    # Recalculate stats after potential merges
+    batch_areas = [sum(img.original_width * img.original_height for img in batch) for batch in batches]
+    total_area = sum(batch_areas)
+    if len(batches) > 0:
+        target_area_per_batch = total_area / len(batches)
+        tqdm.write(f"Area balance: {min(batch_areas)/target_area_per_batch*100:.1f}%-{max(batch_areas)/target_area_per_batch*100:.1f}% of target")
 
     if allow_repeats:
         tqdm.write(f"Note: Repeats will be added after packing to fill blank areas")
