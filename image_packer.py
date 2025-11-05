@@ -1185,14 +1185,14 @@ def process_single_collage(args_tuple):
         args_tuple: Tuple of (batch_idx, batch, output_path, canvas_width, canvas_height,
                              respect_original_size, max_size_variation, overlap_percent,
                              no_uniformity, randomize, bg_color, save_to_file,
-                             allow_repeats, all_images, no_repeats_tolerance)
+                             allow_repeats, all_images, no_repeats_tolerance, min_coverage)
 
     Returns:
         Dictionary with results, statistics, and optionally the canvas
     """
     (batch_idx, batch, output_path, canvas_width, canvas_height,
      respect_original_size, max_size_variation, overlap_percent, no_uniformity, randomize, bg_color,
-     save_to_file, allow_repeats, all_images, no_repeats_tolerance) = args_tuple
+     save_to_file, allow_repeats, all_images, no_repeats_tolerance, min_coverage) = args_tuple
 
     # Create a new packer instance for this batch
     packer = ImagePacker(
@@ -1212,7 +1212,15 @@ def process_single_collage(args_tuple):
     if allow_repeats and all_images:
         initial_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
 
-        if initial_coverage < 90.0:  # Only try to fill if there's significant blank space (90% threshold)
+        # Determine target coverage: use min_coverage if set, otherwise default to 90%
+        target_coverage = min_coverage if min_coverage else 90.0
+
+        # Determine minimum improvement threshold:
+        # If min_coverage is set, accept ANY improvement (try big images first, small if needed)
+        # Otherwise require meaningful improvement (0.5%)
+        MIN_COVERAGE_IMPROVEMENT = 0.0 if min_coverage else 0.5
+
+        if initial_coverage < target_coverage:  # Only try to fill if below target
             # Track which images are already used in this collage
             used_image_ids = {id(img) for img in batch}
 
@@ -1227,21 +1235,15 @@ def process_single_collage(args_tuple):
 
             # Keep trying to add images until we can't add any more
             added_count = 0
-            consecutive_failures = 0
-            max_consecutive_failures = len(candidates)  # Stop after trying all images with no success
-
-            # Try to add images one at a time, checking coverage after each
-            # Only add images that meaningfully improve coverage (min 0.5% per image)
-            MIN_COVERAGE_IMPROVEMENT = 0.5  # percent
 
             for candidate in candidates:
                 # Stop if we've hit safety limit
                 if len(batch) >= MAX_IMAGES_PER_BATCH:
                     break
 
-                # Stop if we've achieved excellent coverage
+                # Stop if we've achieved target coverage
                 current_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
-                if current_coverage >= 90.0:
+                if current_coverage >= target_coverage:
                     break
 
                 # Skip if already used in this collage
@@ -1619,7 +1621,14 @@ def main():
         '--allow-repeats',
         action='store_true',
         help='Allow the same image to appear in multiple canvases (but never twice in the same canvas). '
-             'After initial packing, aggressively fills blank areas with repeated images to maximize coverage (target: 90%%).'
+             'After initial packing, fills blank areas with repeated images. Use with --min-coverage to set target.'
+    )
+    parser.add_argument(
+        '--min-coverage',
+        type=float,
+        metavar='PERCENT',
+        help='Minimum coverage percentage to achieve by adding repeated images (e.g., 90 for 90%%). '
+             'Only works with --allow-repeats. Adds images from largest to smallest until target is reached.'
     )
     parser.add_argument(
         '-n', '--images-per-collage',
@@ -1840,7 +1849,8 @@ def main():
                 not args.pdf,  # save_to_file: False when creating PDF
                 args.allow_repeats,  # allow_repeats
                 images,  # all_images: full image pool for repeat filling
-                args.no_repeats  # no_repeats_tolerance
+                args.no_repeats,  # no_repeats_tolerance
+                args.min_coverage  # min_coverage
             ))
 
         # Process in parallel with progress bar
@@ -1885,8 +1895,16 @@ def main():
             if args.allow_repeats:
                 initial_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
 
-                if initial_coverage < 90.0:  # Only try to fill if there's significant blank space (90% threshold)
-                    print(f"Filling blank areas with repeats (initial coverage: {initial_coverage:.1f}%)...")
+                # Determine target coverage: use min_coverage if set, otherwise default to 90%
+                target_coverage = args.min_coverage if args.min_coverage else 90.0
+
+                # Determine minimum improvement threshold:
+                # If min_coverage is set, accept ANY improvement (try big images first, small if needed)
+                # Otherwise require meaningful improvement (0.5%)
+                MIN_COVERAGE_IMPROVEMENT = 0.0 if args.min_coverage else 0.5
+
+                if initial_coverage < target_coverage:  # Only try to fill if below target
+                    print(f"Filling blank areas with repeats (initial coverage: {initial_coverage:.1f}%, target: {target_coverage:.1f}%)...")
 
                     # Track which images are already used in this collage
                     used_image_ids = {id(img) for img in batch}
@@ -1900,9 +1918,7 @@ def main():
                                        key=lambda img: img.original_width * img.original_height,
                                        reverse=True)
 
-                    # Try to add images one at a time, checking coverage after each
-                    # Only add images that meaningfully improve coverage (min 0.5% per image)
-                    MIN_COVERAGE_IMPROVEMENT = 0.5  # percent
+                    # Keep trying to add images until we can't add any more
                     added_count = 0
 
                     for candidate in candidates:
@@ -1910,9 +1926,9 @@ def main():
                         if len(batch) >= MAX_IMAGES_PER_BATCH:
                             break
 
-                        # Stop if we've achieved excellent coverage
+                        # Stop if we've achieved target coverage
                         current_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
-                        if current_coverage >= 90.0:
+                        if current_coverage >= target_coverage:
                             break
 
                         # Skip if already used in this collage
