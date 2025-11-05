@@ -1680,6 +1680,14 @@ def main():
         print("Error: --no-repeats tolerance must be between 0 and 100")
         return 1
 
+    if args.min_coverage:
+        if not args.allow_repeats:
+            print("Error: --min-coverage requires --allow-repeats flag")
+            return 1
+        if args.min_coverage < 0 or args.min_coverage > 100:
+            print("Error: --min-coverage must be between 0 and 100")
+            return 1
+
     if args.split_tolerance > 0 and not (args.images_per_collage or args.num_collages):
         print("Warning: --split-tolerance requires -n or -p flag to have effect")
 
