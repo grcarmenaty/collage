@@ -2083,6 +2083,13 @@ def main():
         # Single collage with all images
         image_batches = [images]
 
+    # CRITICAL: Final safety check - merge any single-image batches
+    # This catches cases that might have been missed by distribution functions
+    print(f"\nFinal batch check: {len(image_batches)} collage(s) with {[len(b) for b in image_batches]} images each")
+    if len(image_batches) > 1:
+        image_batches = merge_single_image_batches(image_batches)
+        print(f"After merge: {len(image_batches)} collage(s) with {[len(b) for b in image_batches]} images each")
+
     # Generate output filenames
     output_files = []
     if len(image_batches) > 1:
