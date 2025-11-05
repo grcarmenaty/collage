@@ -733,6 +733,101 @@ class ImagePacker:
 
         return True
 
+    def rebuild_free_rectangles_from_canvas(self):
+        """
+        Rebuild the free_rectangles list by scanning the actual canvas.
+
+        This is needed because after growth and overlap adjustments, the guillotine
+        algorithm's tracked free_rectangles may not reflect the actual free space.
+        """
+        # Create a simple occupancy grid (much more accurate than tracking splits)
+        # Use a resolution that balances accuracy and performance
+        grid_resolution = 10  # pixels per grid cell
+        grid_width = (self.canvas_width + grid_resolution - 1) // grid_resolution
+        grid_height = (self.canvas_height + grid_resolution - 1) // grid_resolution
+
+        # Initialize grid as all free
+        occupied = [[False for _ in range(grid_width)] for _ in range(grid_height)]
+
+        # Mark occupied cells
+        for packed in self.packed_images:
+            x1_cell = packed.x // grid_resolution
+            y1_cell = packed.y // grid_resolution
+            x2_cell = min((packed.x + packed.width + grid_resolution - 1) // grid_resolution, grid_width)
+            y2_cell = min((packed.y + packed.height + grid_resolution - 1) // grid_resolution, grid_height)
+
+            for y in range(y1_cell, y2_cell):
+                for x in range(x1_cell, x2_cell):
+                    occupied[y][x] = True
+
+        # Find maximal free rectangles using a greedy approach
+        new_free_rects = []
+        used_cells = [[False for _ in range(grid_width)] for _ in range(grid_height)]
+
+        # Scan for rectangles
+        for start_y in range(grid_height):
+            for start_x in range(grid_width):
+                # Skip if occupied or already used in a rectangle
+                if occupied[start_y][start_x] or used_cells[start_y][start_x]:
+                    continue
+
+                # Try to expand a rectangle from this point
+                # First, find maximum width for this row
+                max_width = 0
+                for x in range(start_x, grid_width):
+                    if occupied[start_y][x] or used_cells[start_y][x]:
+                        break
+                    max_width += 1
+
+                if max_width == 0:
+                    continue
+
+                # Now try to expand downward while maintaining this width
+                max_height = 0
+                for y in range(start_y, grid_height):
+                    # Check if this entire row is free
+                    row_free = True
+                    for x in range(start_x, start_x + max_width):
+                        if occupied[y][x] or used_cells[y][x]:
+                            row_free = False
+                            break
+
+                    if not row_free:
+                        break
+                    max_height += 1
+
+                if max_height == 0:
+                    continue
+
+                # Found a rectangle! Convert from grid to pixels
+                rect_x = start_x * grid_resolution
+                rect_y = start_y * grid_resolution
+                rect_width = min(max_width * grid_resolution, self.canvas_width - rect_x)
+                rect_height = min(max_height * grid_resolution, self.canvas_height - rect_y)
+
+                # Only keep rectangles that are reasonably large (at least 10x10 pixels)
+                if rect_width >= 10 and rect_height >= 10:
+                    new_free_rects.append(Rectangle(rect_x, rect_y, rect_width, rect_height))
+
+                # Mark these cells as used
+                for y in range(start_y, start_y + max_height):
+                    for x in range(start_x, start_x + max_width):
+                        used_cells[y][x] = True
+
+        # Replace the free_rectangles list
+        self.free_rectangles = new_free_rects
+
+        # Log what we found
+        if new_free_rects:
+            total_free_area = sum(r.width * r.height for r in new_free_rects)
+            canvas_area = self.canvas_width * self.canvas_height
+            free_percent = (total_free_area / canvas_area) * 100
+            tqdm.write(f"Rebuilt free rectangles: found {len(new_free_rects)} gaps covering {free_percent:.1f}% of canvas")
+            # Show largest gaps
+            sorted_by_area = sorted(new_free_rects, key=lambda r: r.width * r.height, reverse=True)
+            for i, rect in enumerate(sorted_by_area[:5]):
+                tqdm.write(f"  Gap {i+1}: {rect.width}x{rect.height} at ({rect.x}, {rect.y})")
+
     def fill_gaps_with_repeats(self, candidate_images: List[ImageInfo],
                                target_coverage: float,
                                used_image_ids: set,
@@ -758,7 +853,11 @@ class ImagePacker:
         canvas_area = self.canvas_width * self.canvas_height
         max_iterations = 100  # Increased limit for aggressive filling
 
+        # CRITICAL: Rebuild free rectangles from actual canvas state
+        # The guillotine algorithm's tracked rectangles may be inaccurate after growth/overlap
         tqdm.write(f"Starting aggressive gap-filling to achieve {target_coverage:.1f}% coverage...")
+        tqdm.write(f"Scanning canvas to find all free space...")
+        self.rebuild_free_rectangles_from_canvas()
 
         # Keep trying to add images until we can't add any more or reach target
         with tqdm(total=max_iterations, desc="Filling gaps with repeats", unit="pass", leave=False) as pbar:
@@ -775,6 +874,11 @@ class ImagePacker:
 
                 # Track images added in this iteration
                 iteration_added = 0
+
+                # Rebuild free rectangles every few iterations to catch newly exposed gaps
+                # After placing images, we split rectangles, but might miss larger contiguous areas
+                if iteration > 0 and iteration % 5 == 0:
+                    self.rebuild_free_rectangles_from_canvas()
 
                 # Sort free rectangles by area (largest first) to fill big gaps first
                 sorted_rects = sorted(self.free_rectangles,
