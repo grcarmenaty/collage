@@ -739,10 +739,10 @@ class ImagePacker:
                                used_aspects: set = None,
                                no_repeats_tolerance: float = 0) -> int:
         """
-        Directly fill remaining gaps with scaled-down repeat images.
+        Iteratively fill remaining gaps with scaled-down repeat images until target coverage is achieved.
 
         This method identifies free rectangles and tries to fit images into them
-        without re-packing the entire canvas.
+        without re-packing the entire canvas. Runs multiple passes until target is met.
 
         Args:
             candidate_images: List of images to try (should be sorted by size)
@@ -754,106 +754,130 @@ class ImagePacker:
         Returns:
             Number of images added
         """
-        added_count = 0
+        total_added = 0
         canvas_area = self.canvas_width * self.canvas_height
+        max_iterations = 20  # Safety limit to prevent infinite loops
 
-        # Calculate current coverage
-        current_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
-
-        # Sort free rectangles by area (largest first) to fill big gaps first
-        sorted_rects = sorted(self.free_rectangles,
-                             key=lambda r: r.width * r.height,
-                             reverse=True)
-
-        # Try to fill each significant free rectangle
-        for free_rect in sorted_rects:
-            # Stop if we've achieved target coverage
+        # Keep trying to add images until we can't add any more or reach target
+        for iteration in range(max_iterations):
+            # Calculate current coverage
             current_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
+
+            # Stop if we've achieved target coverage
             if current_coverage >= target_coverage:
                 break
 
-            # Skip very small rectangles (less than 1% of canvas)
-            rect_area = free_rect.width * free_rect.height
-            if rect_area < canvas_area * 0.01:
-                continue
+            # Track images added in this iteration
+            iteration_added = 0
 
-            # Try to fit an image into this rectangle
-            best_candidate = None
-            best_fit_area = 0
+            # Sort free rectangles by area (largest first) to fill big gaps first
+            sorted_rects = sorted(self.free_rectangles,
+                                 key=lambda r: r.width * r.height,
+                                 reverse=True)
 
-            for candidate in candidate_images:
-                # Skip if already used in this canvas
-                if id(candidate) in used_image_ids:
+            # Try to fill each significant free rectangle
+            for free_rect in sorted_rects:
+                # Check coverage again
+                current_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
+                if current_coverage >= target_coverage:
+                    break
+
+                # Skip very small rectangles (less than 0.5% of canvas)
+                rect_area = free_rect.width * free_rect.height
+                if rect_area < canvas_area * 0.005:
                     continue
 
-                # Check no_repeats constraint
-                if used_aspects is not None and no_repeats_tolerance > 0:
-                    if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
+                # Try to fit an image into this rectangle
+                best_candidate = None
+                best_fit_area = 0
+
+                for candidate in candidate_images:
+                    # Skip if already used in this canvas
+                    if id(candidate) in used_image_ids:
                         continue
 
-                # Calculate how large we can make this image in this rectangle
-                aspect = candidate.aspect_ratio
+                    # Check no_repeats constraint
+                    if used_aspects is not None and no_repeats_tolerance > 0:
+                        if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
+                            continue
 
-                # Try to fill the rectangle while maintaining aspect ratio
-                if free_rect.width / free_rect.height > aspect:
-                    # Rectangle is wider than image - constrain by height
-                    fit_height = free_rect.height
-                    fit_width = int(fit_height * aspect)
-                else:
-                    # Rectangle is taller than image - constrain by width
-                    fit_width = free_rect.width
-                    fit_height = int(fit_width / aspect)
+                    # Calculate how large we can make this image in this rectangle
+                    aspect = candidate.aspect_ratio
 
-                # Ensure it fits
-                if fit_width > free_rect.width or fit_height > free_rect.height:
-                    continue
+                    # Try to fill the rectangle while maintaining aspect ratio
+                    if free_rect.width / free_rect.height > aspect:
+                        # Rectangle is wider than image - constrain by height
+                        fit_height = free_rect.height
+                        fit_width = int(fit_height * aspect)
+                    else:
+                        # Rectangle is taller than image - constrain by width
+                        fit_width = free_rect.width
+                        fit_height = int(fit_width / aspect)
 
-                fit_area = fit_width * fit_height
+                    # Ensure it fits
+                    if fit_width > free_rect.width or fit_height > free_rect.height:
+                        continue
 
-                # Check if this placement is valid (no excessive overlaps)
-                if self._check_space_available_with_overlap(
-                    free_rect.x, free_rect.y, fit_width, fit_height, -1
-                ):
-                    # Prefer images that fill more of the rectangle
-                    if fit_area > best_fit_area:
-                        best_fit_area = fit_area
-                        best_candidate = (candidate, fit_width, fit_height)
+                    # Ensure minimum size (at least 10x10 pixels)
+                    if fit_width < 10 or fit_height < 10:
+                        continue
 
-            # If we found a good candidate, place it
-            if best_candidate and best_fit_area > rect_area * 0.3:  # Must fill at least 30% of the rectangle
-                candidate, fit_width, fit_height = best_candidate
+                    fit_area = fit_width * fit_height
 
-                # Add the image
-                self.packed_images.append(PackedImage(
-                    info=candidate,
-                    x=free_rect.x,
-                    y=free_rect.y,
-                    width=fit_width,
-                    height=fit_height
-                ))
+                    # Check if this placement is valid (no excessive overlaps)
+                    if self._check_space_available_with_overlap(
+                        free_rect.x, free_rect.y, fit_width, fit_height, -1
+                    ):
+                        # Prefer images that fill more of the rectangle
+                        if fit_area > best_fit_area:
+                            best_fit_area = fit_area
+                            best_candidate = (candidate, fit_width, fit_height)
 
-                # Update tracking sets
-                used_image_ids.add(id(candidate))
-                if used_aspects is not None:
-                    used_aspects.add(candidate.aspect_ratio)
+                # Adaptive threshold: start with 30% in first iteration, decrease over time
+                # This allows us to fill smaller gaps in later iterations
+                fill_threshold = max(0.1, 0.3 - (iteration * 0.05))
 
-                added_count += 1
+                # If we found a good candidate, place it
+                if best_candidate and best_fit_area > rect_area * fill_threshold:
+                    candidate, fit_width, fit_height = best_candidate
 
-                # Update free rectangles
-                # Remove the used rectangle and add splits
-                if free_rect in self.free_rectangles:
-                    self.free_rectangles.remove(free_rect)
+                    # Add the image
+                    self.packed_images.append(PackedImage(
+                        info=candidate,
+                        x=free_rect.x,
+                        y=free_rect.y,
+                        width=fit_width,
+                        height=fit_height
+                    ))
 
-                new_rects = self.split_rectangle(free_rect, fit_width, fit_height)
-                self.free_rectangles.extend(new_rects)
-                self.remove_redundant_rectangles()
+                    # Update tracking sets
+                    used_image_ids.add(id(candidate))
+                    if used_aspects is not None:
+                        used_aspects.add(candidate.aspect_ratio)
 
-                # Re-sort for next iteration
-                sorted_rects = sorted(self.free_rectangles,
-                                     key=lambda r: r.width * r.height,
-                                     reverse=True)
+                    iteration_added += 1
 
-        return added_count
+                    # Update free rectangles
+                    # Remove the used rectangle and add splits
+                    if free_rect in self.free_rectangles:
+                        self.free_rectangles.remove(free_rect)
+
+                    new_rects = self.split_rectangle(free_rect, fit_width, fit_height)
+                    self.free_rectangles.extend(new_rects)
+                    self.remove_redundant_rectangles()
+
+                    # Re-sort for next rectangle
+                    sorted_rects = sorted(self.free_rectangles,
+                                         key=lambda r: r.width * r.height,
+                                         reverse=True)
+
+            total_added += iteration_added
+
+            # If we didn't add any images this iteration, we're done
+            if iteration_added == 0:
+                break
+
+        return total_added
 
     def pack(self, images: List[ImageInfo]) -> List[PackedImage]:
         """
