@@ -733,6 +733,128 @@ class ImagePacker:
 
         return True
 
+    def fill_gaps_with_repeats(self, candidate_images: List[ImageInfo],
+                               target_coverage: float,
+                               used_image_ids: set,
+                               used_aspects: set = None,
+                               no_repeats_tolerance: float = 0) -> int:
+        """
+        Directly fill remaining gaps with scaled-down repeat images.
+
+        This method identifies free rectangles and tries to fit images into them
+        without re-packing the entire canvas.
+
+        Args:
+            candidate_images: List of images to try (should be sorted by size)
+            target_coverage: Target coverage percentage to achieve
+            used_image_ids: Set of image IDs already used (to avoid duplicates in same canvas)
+            used_aspects: Set of aspect ratios already used (for no-repeats constraint)
+            no_repeats_tolerance: Tolerance for aspect ratio matching
+
+        Returns:
+            Number of images added
+        """
+        added_count = 0
+        canvas_area = self.canvas_width * self.canvas_height
+
+        # Calculate current coverage
+        current_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
+
+        # Sort free rectangles by area (largest first) to fill big gaps first
+        sorted_rects = sorted(self.free_rectangles,
+                             key=lambda r: r.width * r.height,
+                             reverse=True)
+
+        # Try to fill each significant free rectangle
+        for free_rect in sorted_rects:
+            # Stop if we've achieved target coverage
+            current_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
+            if current_coverage >= target_coverage:
+                break
+
+            # Skip very small rectangles (less than 1% of canvas)
+            rect_area = free_rect.width * free_rect.height
+            if rect_area < canvas_area * 0.01:
+                continue
+
+            # Try to fit an image into this rectangle
+            best_candidate = None
+            best_fit_area = 0
+
+            for candidate in candidate_images:
+                # Skip if already used in this canvas
+                if id(candidate) in used_image_ids:
+                    continue
+
+                # Check no_repeats constraint
+                if used_aspects is not None and no_repeats_tolerance > 0:
+                    if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
+                        continue
+
+                # Calculate how large we can make this image in this rectangle
+                aspect = candidate.aspect_ratio
+
+                # Try to fill the rectangle while maintaining aspect ratio
+                if free_rect.width / free_rect.height > aspect:
+                    # Rectangle is wider than image - constrain by height
+                    fit_height = free_rect.height
+                    fit_width = int(fit_height * aspect)
+                else:
+                    # Rectangle is taller than image - constrain by width
+                    fit_width = free_rect.width
+                    fit_height = int(fit_width / aspect)
+
+                # Ensure it fits
+                if fit_width > free_rect.width or fit_height > free_rect.height:
+                    continue
+
+                fit_area = fit_width * fit_height
+
+                # Check if this placement is valid (no excessive overlaps)
+                if self._check_space_available_with_overlap(
+                    free_rect.x, free_rect.y, fit_width, fit_height, -1
+                ):
+                    # Prefer images that fill more of the rectangle
+                    if fit_area > best_fit_area:
+                        best_fit_area = fit_area
+                        best_candidate = (candidate, fit_width, fit_height)
+
+            # If we found a good candidate, place it
+            if best_candidate and best_fit_area > rect_area * 0.3:  # Must fill at least 30% of the rectangle
+                candidate, fit_width, fit_height = best_candidate
+
+                # Add the image
+                self.packed_images.append(PackedImage(
+                    info=candidate,
+                    x=free_rect.x,
+                    y=free_rect.y,
+                    width=fit_width,
+                    height=fit_height
+                ))
+
+                # Update tracking sets
+                used_image_ids.add(id(candidate))
+                if used_aspects is not None:
+                    used_aspects.add(candidate.aspect_ratio)
+
+                added_count += 1
+
+                # Update free rectangles
+                # Remove the used rectangle and add splits
+                if free_rect in self.free_rectangles:
+                    self.free_rectangles.remove(free_rect)
+
+                new_rects = self.split_rectangle(free_rect, fit_width, fit_height)
+                self.free_rectangles.extend(new_rects)
+                self.remove_redundant_rectangles()
+
+                # Re-sort for next iteration
+                sorted_rects = sorted(self.free_rectangles,
+                                     key=lambda r: r.width * r.height,
+                                     reverse=True)
+
+        return added_count
+
     def pack(self, images: List[ImageInfo]) -> List[PackedImage]:
         """
         Pack all images into the canvas.
@@ -1215,16 +1337,12 @@ def process_single_collage(args_tuple):
         # Determine target coverage: use min_coverage if set, otherwise default to 90%
         target_coverage = min_coverage if min_coverage else 90.0
 
-        # Determine minimum improvement threshold:
-        # If min_coverage is set, accept ANY improvement (try big images first, small if needed)
-        # Otherwise require meaningful improvement (0.5%)
-        MIN_COVERAGE_IMPROVEMENT = 0.0 if min_coverage else 0.5
-
         if initial_coverage < target_coverage:  # Only try to fill if below target
             # Track which images are already used in this collage
             used_image_ids = {id(img) for img in batch}
 
             # Track aspect ratios if no_repeats_tolerance is enabled
+            used_aspects = None
             if no_repeats_tolerance > 0:
                 used_aspects = {img.aspect_ratio for img in batch}
 
@@ -1233,61 +1351,21 @@ def process_single_collage(args_tuple):
                                key=lambda img: img.original_width * img.original_height,
                                reverse=True)
 
-            # Keep trying to add images until we can't add any more
-            added_count = 0
+            # Use the new direct gap-filling method
+            added_count = packer.fill_gaps_with_repeats(
+                candidate_images=candidates,
+                target_coverage=target_coverage,
+                used_image_ids=used_image_ids,
+                used_aspects=used_aspects,
+                no_repeats_tolerance=no_repeats_tolerance
+            )
 
-            for candidate in candidates:
-                # Stop if we've hit safety limit
-                if len(batch) >= MAX_IMAGES_PER_BATCH:
-                    break
-
-                # Stop if we've achieved target coverage
-                current_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
-                if current_coverage >= target_coverage:
-                    break
-
-                # Skip if already used in this collage
-                if id(candidate) in used_image_ids:
-                    continue
-
-                # Check no_repeats constraint (aspect ratio)
-                if no_repeats_tolerance > 0:
-                    if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
-                        continue
-
-                # Try to pack this image with a FRESH packer instance
-                test_batch = batch + [candidate]
-                test_packer = ImagePacker(
-                    canvas_width,
-                    canvas_height,
-                    respect_original_size=respect_original_size,
-                    max_size_variation=max_size_variation,
-                    overlap_percent=overlap_percent,
-                    no_uniformity=no_uniformity,
-                    randomize=randomize
-                )
-                test_packed = test_packer.pack(test_batch)
-
-                # Check if it packed successfully AND improves coverage meaningfully
-                if len(test_packed) > len(packed):
-                    new_coverage = sum(p.width * p.height for p in test_packed) / (canvas_width * canvas_height) * 100
-                    coverage_improvement = new_coverage - current_coverage
-
-                    # Only accept if coverage improves by at least MIN_COVERAGE_IMPROVEMENT
-                    if coverage_improvement >= MIN_COVERAGE_IMPROVEMENT:
-                        packed = test_packed
-                        batch = test_batch
-                        used_image_ids.add(id(candidate))
-                        if no_repeats_tolerance > 0:
-                            used_aspects.add(candidate.aspect_ratio)
-                        added_count += 1
-
-                        # Update packer to use the successful pack
-                        packer = test_packer
+            # Update packed images from packer
+            packed = packer.packed_images
 
             if added_count > 0:
                 final_coverage = sum(p.width * p.height for p in packed) / (canvas_width * canvas_height) * 100
-                tqdm.write(f"Collage {batch_idx}: Added {added_count} repeat images to fill blanks "
+                tqdm.write(f"Collage {batch_idx}: Added {added_count} repeat images to fill gaps "
                           f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
 
 
@@ -1906,11 +1984,6 @@ def main():
                 # Determine target coverage: use min_coverage if set, otherwise default to 90%
                 target_coverage = args.min_coverage if args.min_coverage else 90.0
 
-                # Determine minimum improvement threshold:
-                # If min_coverage is set, accept ANY improvement (try big images first, small if needed)
-                # Otherwise require meaningful improvement (0.5%)
-                MIN_COVERAGE_IMPROVEMENT = 0.0 if args.min_coverage else 0.5
-
                 if initial_coverage < target_coverage:  # Only try to fill if below target
                     print(f"Filling blank areas with repeats (initial coverage: {initial_coverage:.1f}%, target: {target_coverage:.1f}%)...")
 
@@ -1918,6 +1991,7 @@ def main():
                     used_image_ids = {id(img) for img in batch}
 
                     # Track aspect ratios if no_repeats_tolerance is enabled
+                    used_aspects = None
                     if args.no_repeats > 0:
                         used_aspects = {img.aspect_ratio for img in batch}
 
@@ -1926,61 +2000,21 @@ def main():
                                        key=lambda img: img.original_width * img.original_height,
                                        reverse=True)
 
-                    # Keep trying to add images until we can't add any more
-                    added_count = 0
+                    # Use the new direct gap-filling method
+                    added_count = packer.fill_gaps_with_repeats(
+                        candidate_images=candidates,
+                        target_coverage=target_coverage,
+                        used_image_ids=used_image_ids,
+                        used_aspects=used_aspects,
+                        no_repeats_tolerance=args.no_repeats
+                    )
 
-                    for candidate in candidates:
-                        # Stop if we've hit safety limit
-                        if len(batch) >= MAX_IMAGES_PER_BATCH:
-                            break
-
-                        # Stop if we've achieved target coverage
-                        current_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
-                        if current_coverage >= target_coverage:
-                            break
-
-                        # Skip if already used in this collage
-                        if id(candidate) in used_image_ids:
-                            continue
-
-                        # Check no_repeats constraint (aspect ratio)
-                        if args.no_repeats > 0:
-                            if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, args.no_repeats):
-                                continue
-
-                        # Try to pack this image with a FRESH packer instance
-                        test_batch = batch + [candidate]
-                        test_packer = ImagePacker(
-                            args.width,
-                            args.height,
-                            respect_original_size=args.respect_original_size,
-                            max_size_variation=args.max_size_variation,
-                            overlap_percent=args.overlap_percent,
-                            no_uniformity=args.no_uniformity,
-                            randomize=args.randomize
-                        )
-                        test_packed = test_packer.pack(test_batch)
-
-                        # Check if it packed successfully AND improves coverage meaningfully
-                        if len(test_packed) > len(packed):
-                            new_coverage = sum(p.width * p.height for p in test_packed) / (args.width * args.height) * 100
-                            coverage_improvement = new_coverage - current_coverage
-
-                            # Only accept if coverage improves by at least MIN_COVERAGE_IMPROVEMENT
-                            if coverage_improvement >= MIN_COVERAGE_IMPROVEMENT:
-                                packed = test_packed
-                                batch = test_batch
-                                used_image_ids.add(id(candidate))
-                                if args.no_repeats > 0:
-                                    used_aspects.add(candidate.aspect_ratio)
-                                added_count += 1
-
-                                # Update packer to use the successful pack
-                                packer = test_packer
+                    # Update packed images from packer
+                    packed = packer.packed_images
 
                     if added_count > 0:
                         final_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
-                        print(f"Added {added_count} repeat images to fill blanks "
+                        print(f"Added {added_count} repeat images to fill gaps "
                               f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
 
 
