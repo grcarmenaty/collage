@@ -855,13 +855,19 @@ class ImagePacker:
 
         tqdm.write(f"Starting aggressive gap-filling to achieve {target_coverage:.1f}% coverage...")
 
+        # FREEZER MECHANISM: Cycle through all images before repeating
+        # Images used as repeats go into freezer, when all frozen, unfreeze all and continue
+        freezer = set()  # IDs of images currently in freezer
+        available_repeats = [img for img in candidate_images]  # Images available as repeats
+        unfreeze_count = 0  # Track how many times we've unfrozen
+
         # Keep trying to add images until we can't add any more or reach target
         with tqdm(total=max_iterations, desc="Filling gaps with repeats", unit="pass", leave=False) as pbar:
             for iteration in range(max_iterations):
                 # Calculate current coverage
                 current_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
 
-                pbar.set_postfix({'coverage': f'{current_coverage:.1f}%', 'added': total_added})
+                pbar.set_postfix({'coverage': f'{current_coverage:.1f}%', 'added': total_added, 'frozen': len(freezer)})
 
                 # Stop if we've achieved target coverage
                 if current_coverage >= target_coverage:
@@ -879,6 +885,14 @@ class ImagePacker:
                 if not self.free_rectangles:
                     pbar.write(f"No more gaps to fill")
                     break
+
+                # Check if all images are frozen - if so, unfreeze them all
+                available_for_repeats = [img for img in available_repeats if id(img) not in freezer]
+                if not available_for_repeats:
+                    freezer.clear()
+                    unfreeze_count += 1
+                    pbar.write(f"All images used - unfreezing all images (cycle {unfreeze_count})")
+                    available_for_repeats = available_repeats.copy()
 
                 # NEW STRATEGY: Place ONE image per iteration, as LARGE as possible
                 # Try multiple positions from largest gaps and choose best
@@ -927,9 +941,9 @@ class ImagePacker:
                                 best_coverage = coverage
                                 best_placement = (candidate, gap.x, gap.y, test_width, test_height, False)
 
-                # PASS 2: If no unused image works, try repeats
+                # PASS 2: If no unused image works, try repeats (from available_for_repeats only)
                 if not best_placement:
-                    for candidate in candidate_images:
+                    for candidate in available_for_repeats:
                         # Check aspect ratio constraint
                         if used_aspects is not None and no_repeats_tolerance > 0:
                             if aspect_ratio_in_set(candidate.aspect_ratio, used_aspects, no_repeats_tolerance):
@@ -972,6 +986,10 @@ class ImagePacker:
                     used_image_ids.add(id(candidate))
                     iteration_added = 1
 
+                    # If this was a repeat, add to freezer
+                    if is_repeat:
+                        freezer.add(id(candidate))
+
                 total_added += iteration_added
                 pbar.update(1)
 
@@ -980,6 +998,9 @@ class ImagePacker:
                     final_coverage = sum(p.width * p.height for p in self.packed_images) / canvas_area * 100
                     pbar.write(f"Gap-filling complete: {final_coverage:.2f}% coverage (no more gaps can be filled)")
                     break
+
+        if unfreeze_count > 0:
+            tqdm.write(f"Cycled through all images {unfreeze_count} time(s) to maximize coverage")
 
         return total_added
 
