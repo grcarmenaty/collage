@@ -1452,11 +1452,13 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
             remaining_images = images
             batch_aspect_counts = None
     else:
-        # With allow_repeats, we start fresh and distribute all images first
+        # With allow_repeats, use UNIVERSAL FREEZER to ensure no image appears
+        # in multiple collages until ALL images have been used once
         batches = [[] for _ in range(num_batches)]
         remaining_images = images
         batch_aspect_counts = None
-        tqdm.write(f"Using allow-repeats mode: will optimize base images first, then add repeats to fill")
+        tqdm.write(f"Using allow-repeats mode with UNIVERSAL FREEZER:")
+        tqdm.write(f"  Each image will appear in exactly ONE collage before any repeats")
 
     # Sort images by area (largest first)
     sorted_by_size = sorted(remaining_images,
@@ -1484,12 +1486,40 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
     else:
         batch_aspect_ratios = None
 
-    # FIRST PASS: Distribute each image once (base optimization)
-    for idx, img in enumerate(sorted_by_size):
+    # UNIVERSAL FREEZER for base distribution (allow_repeats mode)
+    # Tracks which images have already been assigned to a batch
+    # Images can't be assigned to another batch until ALL images have been assigned once
+    global_used_images = set()  # Images already assigned to at least one batch
+    cycle_count = 0
+
+    # FIRST PASS: Distribute images ensuring each appears in only ONE batch initially
+    # Keep distributing until all batches have enough images
+    img_idx = 0
+    min_images_per_batch = max(2, len(sorted_by_size) // num_batches)  # At least 2 per batch
+
+    while any(len(batch) < min_images_per_batch for batch in batches):
+        # Get next image (cycle through if needed)
+        if img_idx >= len(sorted_by_size):
+            if allow_repeats:
+                # Reset for next cycle
+                global_used_images.clear()
+                cycle_count += 1
+                img_idx = 0
+                tqdm.write(f"🔄 BASE DISTRIBUTION: All images used once, starting cycle {cycle_count + 1}")
+            else:
+                # No more images available
+                break
+
+        img = sorted_by_size[img_idx]
+        img_idx += 1
+
+        # Skip if already assigned to a batch (in current cycle)
+        if allow_repeats and id(img) in global_used_images:
+            continue
         if no_repeats_tolerance > 0:
             # Find a batch that doesn't already have this aspect ratio (within tolerance)
             img_aspect = img.aspect_ratio
-            batch_idx = idx % num_batches
+            batch_idx = img_idx % num_batches
             attempts = 0
 
             # Try round-robin assignment, avoiding batches with equivalent aspect ratios
@@ -1499,6 +1529,9 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
                     batches[batch_idx].append(img)
                     batch_aspect_ratios[batch_idx].add(img_aspect)
                     batch_image_sets[batch_idx].add(id(img))
+                    # Mark as used in global tracker (for allow_repeats mode)
+                    if allow_repeats:
+                        global_used_images.add(id(img))
                     break
                 batch_idx = (batch_idx + 1) % num_batches
                 attempts += 1
@@ -1513,10 +1546,13 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
                 tqdm.write(f"Created additional batch to enforce --no-repeats constraint (aspect ratio {img_aspect:.3f})")
         else:
             # No aspect ratio constraints, simple round-robin
-            batch_idx = idx % num_batches
+            batch_idx = img_idx % num_batches
             if len(batches[batch_idx]) < MAX_IMAGES_PER_BATCH:
                 batches[batch_idx].append(img)
                 batch_image_sets[batch_idx].add(id(img))
+                # Mark as used in global tracker (for allow_repeats mode)
+                if allow_repeats:
+                    global_used_images.add(id(img))
 
 
     # Further optimize by swapping images to balance aspect ratio diversity
@@ -1547,6 +1583,8 @@ def optimize_image_distribution(images: List[ImageInfo], num_batches: int, no_re
         tqdm.write(f"Area balance: {min(batch_areas)/target_area_per_batch*100:.1f}%-{max(batch_areas)/target_area_per_batch*100:.1f}% of target")
 
     if allow_repeats:
+        if cycle_count > 0:
+            tqdm.write(f"🔄 BASE DISTRIBUTION: Cycled through all images {cycle_count + 1} time(s) to fill batches")
         tqdm.write(f"Note: Repeats will be added after packing to fill blank areas")
 
     return batches
