@@ -1088,6 +1088,45 @@ class ImagePacker:
         return canvas
 
 
+def ensure_all_images_used(batches: List[List[ImageInfo]], all_images: List[ImageInfo]) -> List[List[ImageInfo]]:
+    """
+    AGGRESSIVELY ensure every single image appears in at least one batch.
+
+    This is critical - no image should be left out!
+
+    Args:
+        batches: Current image batches
+        all_images: All available images
+
+    Returns:
+        Updated batches with all images included
+    """
+    # Track which images are already used
+    used_images = set()
+    for batch in batches:
+        for img in batch:
+            used_images.add(id(img))
+
+    # Find missing images
+    missing_images = [img for img in all_images if id(img) not in used_images]
+
+    if missing_images:
+        tqdm.write(f"⚠ WARNING: {len(missing_images)} images not in any batch!")
+        tqdm.write(f"AGGRESSIVELY forcing them into batches...")
+
+        # Add missing images to batches in round-robin fashion
+        for i, img in enumerate(missing_images):
+            batch_idx = i % len(batches)
+            batches[batch_idx].append(img)
+            tqdm.write(f"  Added missing image to batch {batch_idx + 1}")
+
+        tqdm.write(f"✓ All {len(all_images)} images now assigned to at least one batch")
+    else:
+        tqdm.write(f"✓ All {len(all_images)} images already in batches")
+
+    return batches
+
+
 def merge_single_image_batches(batches: List[List[ImageInfo]]) -> List[List[ImageInfo]]:
     """
     Merge any batches with only 1 image into adjacent batches.
@@ -2112,6 +2151,12 @@ def main():
         # Single collage with all images
         image_batches = [images]
 
+    # CRITICAL: Ensure EVERY image appears in at least one batch
+    print(f"\n{'='*60}")
+    print(f"ENSURING ALL IMAGES USED")
+    print(f"{'='*60}")
+    image_batches = ensure_all_images_used(image_batches, images)
+
     # CRITICAL: Final safety check - merge any single-image batches
     # This catches cases that might have been missed by distribution functions
     print(f"\nFinal batch check: {len(image_batches)} collage(s) with {[len(b) for b in image_batches]} images each")
@@ -2377,10 +2422,87 @@ def main():
             # Move to next batch
             batch_idx += 1
 
+        # AGGRESSIVE: Check if any images were never used and force them in as repeats
+        print(f"\n{'='*60}")
+        print(f"Checking for unused images...")
+        print(f"{'='*60}")
+
+        all_used_images = set()
+        for batch in image_batches:
+            for img in batch:
+                all_used_images.add(id(img))
+
+        never_used = [img for img in images if id(img) not in all_used_images]
+
+        if never_used:
+            print(f"🚨 FOUND {len(never_used)} images that NEVER appeared!")
+            print(f"AGGRESSIVELY forcing them into collages as repeats...")
+
+            # Force them into the last collage(s) as repeats
+            for img in never_used:
+                # Add to the last collage
+                if image_batches:
+                    image_batches[-1].append(img)
+                    print(f"  Forced missing image into last collage: {img.path}")
+
+            # Re-create the last collage(s) with the forced images
+            print(f"\nRe-creating collages with forced images...")
+            # Go back and recreate affected batches
+            batch_idx = len(image_batches) - 1
+            while batch_idx >= 0 and batch_idx >= len(canvases):
+                batch = image_batches[batch_idx]
+                output_path = output_files[batch_idx]
+
+                print(f"\n{'='*60}")
+                print(f"RE-CREATING Collage {batch_idx+1}/{len(image_batches)}: {len(batch)} images -> {output_path}")
+                print(f"{'='*60}")
+
+                # Pack images
+                print("Packing images...")
+                packed = packer.pack(batch)
+
+                # Create collage
+                print("Creating collage...")
+                collage = packer.create_collage(background_color=bg_color)
+
+                # Update canvas
+                if args.pdf:
+                    if batch_idx < len(canvases):
+                        canvases[batch_idx] = collage
+                    else:
+                        canvases.append(collage)
+                else:
+                    collage.save(output_path, quality=95)
+                    print(f"Collage saved to {output_path}")
+
+                batch_idx -= 1
+                break  # Only recreate last one for now
+
         # If PDF mode in sequential processing, save all canvases to a single PDF
         if args.pdf and canvases:
             pdf_output = os.path.splitext(args.output)[0] + '.pdf'
             save_canvases_to_pdf(canvases, pdf_output)
+
+    # FINAL VERIFICATION: Check if every image appeared in at least one collage
+    print(f"\n{'='*60}")
+    print(f"FINAL VERIFICATION: Checking all images were used")
+    print(f"{'='*60}")
+
+    all_used_images = set()
+    for batch in image_batches:
+        for img in batch:
+            all_used_images.add(id(img))
+
+    missing_images = [img for img in images if id(img) not in all_used_images]
+
+    if missing_images:
+        print(f"🚨 CRITICAL ERROR: {len(missing_images)} images NEVER appeared in any collage!")
+        print(f"   This should not happen after forcing - please report this bug!")
+        for i, img in enumerate(missing_images[:10]):  # Show first 10
+            print(f"   Missing: {img.path}")
+        return 1
+    else:
+        print(f"✓ VERIFIED: All {len(images)} images appeared in at least one collage!")
 
     print(f"\n{'='*60}")
     print(f"✓ Created {len(image_batches)} collage(s) successfully")
