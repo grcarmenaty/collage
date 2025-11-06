@@ -832,7 +832,9 @@ class ImagePacker:
                                target_coverage: float,
                                used_image_ids: set,
                                used_aspects: set = None,
-                               no_repeats_tolerance: float = 0) -> int:
+                               no_repeats_tolerance: float = 0,
+                               freezer: set = None,
+                               unfreeze_count: list = None) -> int:
         """
         ULTRA-AGGRESSIVE gap filling: Iteratively fill ALL gaps with scaled repeats until target is achieved.
 
@@ -845,6 +847,8 @@ class ImagePacker:
             used_image_ids: Set of image IDs - IGNORED for gap filling, allows unlimited repeats
             used_aspects: Set of aspect ratios already used (for no-repeats constraint)
             no_repeats_tolerance: Tolerance for aspect ratio matching
+            freezer: SHARED set of frozen image IDs across all collages (universal freezer)
+            unfreeze_count: SHARED list with single int element tracking unfreeze cycles
 
         Returns:
             Number of images added
@@ -855,11 +859,15 @@ class ImagePacker:
 
         tqdm.write(f"Starting aggressive gap-filling to achieve {target_coverage:.1f}% coverage...")
 
-        # FREEZER MECHANISM: Cycle through all images before repeating
+        # UNIVERSAL FREEZER MECHANISM: Shared across ALL collages
         # Images used as repeats go into freezer, when all frozen, unfreeze all and continue
-        freezer = set()  # IDs of images currently in freezer
+        # Initialize freezer if not provided (backward compatibility)
+        if freezer is None:
+            freezer = set()
+        if unfreeze_count is None:
+            unfreeze_count = [0]
+
         available_repeats = [img for img in candidate_images]  # Images available as repeats
-        unfreeze_count = 0  # Track how many times we've unfrozen
 
         # Keep trying to add images until we can't add any more or reach target
         with tqdm(total=max_iterations, desc="Filling gaps with repeats", unit="pass", leave=False) as pbar:
@@ -890,8 +898,8 @@ class ImagePacker:
                 available_for_repeats = [img for img in available_repeats if id(img) not in freezer]
                 if not available_for_repeats:
                     freezer.clear()
-                    unfreeze_count += 1
-                    pbar.write(f"All images used - unfreezing all images (cycle {unfreeze_count})")
+                    unfreeze_count[0] += 1
+                    pbar.write(f"🔄 UNIVERSAL UNFREEZE: All {len(available_repeats)} images used across all collages - cycle {unfreeze_count[0]}")
                     available_for_repeats = available_repeats.copy()
 
                 # NEW STRATEGY: Place ONE image per iteration, as LARGE as possible
@@ -999,8 +1007,8 @@ class ImagePacker:
                     pbar.write(f"Gap-filling complete: {final_coverage:.2f}% coverage (no more gaps can be filled)")
                     break
 
-        if unfreeze_count > 0:
-            tqdm.write(f"Cycled through all images {unfreeze_count} time(s) to maximize coverage")
+        if unfreeze_count[0] > 0:
+            tqdm.write(f"🔄 Total cycles: Went through all {len(available_repeats)} images {unfreeze_count[0]} time(s) across all collages")
 
         return total_added
 
@@ -2135,6 +2143,11 @@ def main():
         # Parallel processing for multiple collages
         print(f"\nProcessing {len(image_batches)} collages using {num_jobs} parallel workers...")
 
+        if args.allow_repeats:
+            print(f"⚠ NOTE: Parallel mode cannot share freezer across collages.")
+            print(f"   Repeat images may be less evenly distributed.")
+            print(f"   For best repeat distribution, use -j 1 (sequential mode).")
+
         # Prepare arguments for parallel processing
         job_args = []
         for batch_idx, (batch, output_path) in enumerate(zip(image_batches, output_files), 1):
@@ -2202,6 +2215,13 @@ def main():
             print("\nCreating single collage...")
         else:
             print(f"\nCreating {len(image_batches)} collages sequentially...")
+
+        # UNIVERSAL FREEZER: Shared across ALL collages in this session
+        # Ensures no image is used as a repeat twice until ALL images have been used
+        universal_freezer = set()
+        universal_unfreeze_count = [0]
+        if args.allow_repeats and len(image_batches) > 1:
+            print(f"🧊 Universal freezer enabled: Each image will be used once as repeat before any repeats")
 
         canvases = []  # For PDF mode
         batch_idx = 0
@@ -2278,13 +2298,15 @@ def main():
                     print(f"Scanning canvas to detect all gaps...")
                     packer.rebuild_free_rectangles_from_canvas()
 
-                    # Use the new direct gap-filling method
+                    # Use the new direct gap-filling method with UNIVERSAL freezer
                     added_count = packer.fill_gaps_with_repeats(
                         candidate_images=candidates,
                         target_coverage=target_coverage,
                         used_image_ids=used_image_ids,
                         used_aspects=used_aspects,
-                        no_repeats_tolerance=args.no_repeats
+                        no_repeats_tolerance=args.no_repeats,
+                        freezer=universal_freezer,
+                        unfreeze_count=universal_unfreeze_count
                     )
 
                     # Update packed images from packer
