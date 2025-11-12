@@ -2447,7 +2447,7 @@ def main():
                         if not packer_inst.free_rectangles:
                             continue
 
-                        # Find best position in this collage
+                        # Try ALL gaps in this collage and find the BEST one
                         for gap in packer_inst.free_rectangles:
                             aspect = next_img.aspect_ratio
 
@@ -2466,20 +2466,24 @@ def main():
                             if packer_inst._check_space_available_with_overlap(
                                 gap.x, gap.y, fit_width, fit_height, -1
                             ):
-                                # Score based on: coverage deficit * fit quality
+                                # Score based on SIZE of the placement (prioritize largest)
+                                # Larger placements are MUCH better
+                                placement_size = fit_width * fit_height
+
+                                # Secondary factor: coverage deficit (prefer collages that need it more)
                                 current_coverage = sum(p.width * p.height for p in packer_inst.packed_images) / (args.width * args.height) * 100
-                                deficit = target_coverage - current_coverage
-                                fit_quality = (fit_width * fit_height) / (gap.width * gap.height)
-                                score = deficit * fit_quality
+                                deficit_factor = (target_coverage - current_coverage) / 100.0
+
+                                # Score = SIZE is primary (80%), deficit is secondary (20%)
+                                score = (placement_size * 0.8) + (placement_size * deficit_factor * 0.2)
 
                                 if score > best_score:
                                     best_score = score
-                                    best_placement = (idx, next_img, gap.x, gap.y, fit_width, fit_height)
-                                break  # Take first valid position
+                                    best_placement = (idx, next_img, gap.x, gap.y, fit_width, fit_height, placement_size)
 
                     # Place the image in the best collage
                     if best_placement:
-                        collage_idx, img, x, y, width, height = best_placement
+                        collage_idx, img, x, y, width, height, placement_size = best_placement
 
                         packers[collage_idx].packed_images.append(PackedImage(
                             info=img,
@@ -2493,7 +2497,9 @@ def main():
                         images_added += 1
 
                         if images_added % 10 == 0:
-                            print(f"  Added {images_added} images across collages...")
+                            # Show the largest placement size for transparency
+                            avg_size = placement_size
+                            print(f"  Added {images_added} images (last: {width}x{height} = {placement_size:,} pixels)")
                     else:
                         # Image doesn't fit anywhere, freeze it anyway
                         universal_freezer.add(id(next_img))
