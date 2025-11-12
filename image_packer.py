@@ -2306,108 +2306,214 @@ def main():
         if args.allow_repeats and len(image_batches) > 1:
             print(f"🧊 Universal freezer enabled: Each image will be used once as repeat before any repeats")
 
+        # PHASE 1: Create all base collages first (without gap-filling)
+        print(f"\n{'='*60}")
+        print(f"PHASE 1: Creating base collages")
+        print(f"{'='*60}")
+
+        packers = []  # Store packer for each collage
+        packed_lists = []  # Store packed images for each collage
         canvases = []  # For PDF mode
         batch_idx = 0
+
         while batch_idx < len(image_batches):
             batch = image_batches[batch_idx]
             output_path = output_files[batch_idx]
 
-            print(f"\n{'='*60}")
-            print(f"Collage {batch_idx+1}/{len(image_batches)}: {len(batch)} images -> {output_path}")
-            print(f"{'='*60}")
+            print(f"\nCollage {batch_idx+1}/{len(image_batches)}: Packing {len(batch)} base images...")
+
+            # Create packer for this batch
+            batch_packer = ImagePacker(
+                args.width,
+                args.height,
+                respect_original_size=args.respect_original_size,
+                max_size_variation=args.max_size_variation,
+                overlap_percent=args.overlap_percent,
+                no_uniformity=args.no_uniformity,
+                randomize=args.randomize
+            )
 
             # Pack images
-            print("Packing images...")
-            packed = packer.pack(batch)
+            packed = batch_packer.pack(batch)
 
             # CRITICAL: Check if packing failed to fit enough images
-            # If batch has 2+ images but only 1 packed, we need to retry with more images
             if len(batch) >= 2 and len(packed) == 1:
-                print(f"\n⚠ WARNING: Only {len(packed)} out of {len(batch)} images fit on canvas!")
+                print(f"⚠ WARNING: Only {len(packed)} out of {len(batch)} images fit on canvas!")
                 print(f"This would create a single-image collage, which is not allowed.")
 
                 # Try to merge with next batch and retry
                 if batch_idx < len(image_batches) - 1:
                     print(f"Merging batch {batch_idx+1} with batch {batch_idx+2} and retrying...")
-                    # Merge current batch with next batch
                     image_batches[batch_idx].extend(image_batches[batch_idx + 1])
-                    # Remove the next batch
                     image_batches.pop(batch_idx + 1)
                     output_files.pop(batch_idx + 1)
-                    # Retry this batch (don't increment batch_idx)
                     print(f"Retry: Batch now has {len(image_batches[batch_idx])} images")
                     continue
+                elif batch_idx > 0:
+                    print(f"Merging batch {batch_idx+1} with batch {batch_idx}...")
+                    image_batches[batch_idx - 1].extend(image_batches[batch_idx])
+                    image_batches.pop(batch_idx)
+                    output_files.pop(batch_idx)
+                    batch_idx -= 1
+                    print(f"Retry: Batch {batch_idx+1} now has {len(image_batches[batch_idx])} images")
+                    continue
                 else:
-                    # Last batch - try to merge with previous
-                    if batch_idx > 0:
-                        print(f"Merging batch {batch_idx+1} with batch {batch_idx} and retrying...")
-                        # Merge with previous batch
-                        image_batches[batch_idx - 1].extend(image_batches[batch_idx])
-                        # Remove current batch
-                        image_batches.pop(batch_idx)
-                        output_files.pop(batch_idx)
-                        # Go back and retry the previous batch
-                        batch_idx -= 1
-                        print(f"Retry: Batch {batch_idx+1} now has {len(image_batches[batch_idx])} images")
+                    print(f"ERROR: Cannot merge - this is the only batch!")
+                    print(f"Try increasing canvas size with -W and -H")
+
+            coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+            print(f"  Base coverage: {coverage:.1f}%")
+
+            packers.append(batch_packer)
+            packed_lists.append(packed)
+            batch_idx += 1
+
+        # PHASE 2: Global gap-filling across ALL collages
+        if args.allow_repeats and len(image_batches) > 1:
+            print(f"\n{'='*60}")
+            print(f"PHASE 2: Filling gaps across ALL collages")
+            print(f"{'='*60}")
+
+            target_coverage = args.min_coverage if args.min_coverage else 90.0
+
+            # Check which collages need more coverage
+            collages_needing_fill = []
+            for idx, (packer_inst, packed) in enumerate(zip(packers, packed_lists)):
+                coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+                if coverage < target_coverage:
+                    collages_needing_fill.append((idx, coverage))
+                    print(f"Collage {idx+1}: {coverage:.1f}% coverage (needs {target_coverage:.1f}%)")
+
+            if collages_needing_fill:
+                print(f"\n{len(collages_needing_fill)} collage(s) need gap-filling")
+                print(f"Iterating through images in freezer order...")
+
+                # Sort all images by size
+                candidates = sorted(images,
+                                   key=lambda img: img.original_width * img.original_height,
+                                   reverse=True)
+
+                images_added = 0
+                max_iterations = len(candidates) * 10  # Safety limit
+
+                for iteration in range(max_iterations):
+                    # Check if all collages meet target
+                    all_satisfied = True
+                    for idx, _ in collages_needing_fill:
+                        coverage = sum(p.width * p.height for p in packers[idx].packed_images) / (args.width * args.height) * 100
+                        if coverage < target_coverage:
+                            all_satisfied = False
+                            break
+
+                    if all_satisfied:
+                        print(f"✓ All collages now meet {target_coverage:.1f}% coverage!")
+                        break
+
+                    # Get next available image from freezer
+                    next_img = None
+                    for candidate in candidates:
+                        if id(candidate) not in universal_freezer:
+                            next_img = candidate
+                            break
+
+                    # If all frozen, unfreeze and continue
+                    if not next_img:
+                        universal_freezer.clear()
+                        universal_unfreeze_count[0] += 1
+                        print(f"🔄 All images used - unfreezing all (cycle {universal_unfreeze_count[0]})")
                         continue
+
+                    # Find which collage this image fits best into
+                    best_placement = None
+                    best_score = -1
+
+                    for idx, _ in collages_needing_fill:
+                        batch = image_batches[idx]
+                        packer_inst = packers[idx]
+
+                        # Skip if already used in this collage's base batch
+                        if id(next_img) in {id(img) for img in batch}:
+                            continue
+
+                        # Check aspect ratio constraint
+                        if args.no_repeats > 0:
+                            batch_aspects = {img.aspect_ratio for img in batch}
+                            if aspect_ratio_in_set(next_img.aspect_ratio, batch_aspects, args.no_repeats):
+                                continue
+
+                        # Rebuild free rectangles for this collage
+                        packer_inst.rebuild_free_rectangles_from_canvas()
+
+                        if not packer_inst.free_rectangles:
+                            continue
+
+                        # Find best position in this collage
+                        for gap in packer_inst.free_rectangles:
+                            aspect = next_img.aspect_ratio
+
+                            if gap.width / gap.height > aspect:
+                                fit_height = gap.height
+                                fit_width = int(fit_height * aspect)
+                            else:
+                                fit_width = gap.width
+                                fit_height = int(fit_width / aspect)
+
+                            if fit_width < 1 or fit_height < 1:
+                                continue
+                            if fit_width > gap.width or fit_height > gap.height:
+                                continue
+
+                            if packer_inst._check_space_available_with_overlap(
+                                gap.x, gap.y, fit_width, fit_height, -1
+                            ):
+                                # Score based on: coverage deficit * fit quality
+                                current_coverage = sum(p.width * p.height for p in packer_inst.packed_images) / (args.width * args.height) * 100
+                                deficit = target_coverage - current_coverage
+                                fit_quality = (fit_width * fit_height) / (gap.width * gap.height)
+                                score = deficit * fit_quality
+
+                                if score > best_score:
+                                    best_score = score
+                                    best_placement = (idx, next_img, gap.x, gap.y, fit_width, fit_height)
+                                break  # Take first valid position
+
+                    # Place the image in the best collage
+                    if best_placement:
+                        collage_idx, img, x, y, width, height = best_placement
+
+                        packers[collage_idx].packed_images.append(PackedImage(
+                            info=img,
+                            x=x,
+                            y=y,
+                            width=width,
+                            height=height
+                        ))
+
+                        universal_freezer.add(id(img))
+                        images_added += 1
+
+                        if images_added % 10 == 0:
+                            print(f"  Added {images_added} images across collages...")
                     else:
-                        print(f"ERROR: Cannot merge - this is the only batch!")
-                        print(f"Try increasing canvas size with -W and -H")
+                        # Image doesn't fit anywhere, freeze it anyway
+                        universal_freezer.add(id(next_img))
 
-            # Aggressively fill blank areas with repeats if enabled
-            if args.allow_repeats:
-                initial_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
+                print(f"✓ Gap-filling complete: added {images_added} repeat images across all collages")
+                if universal_unfreeze_count[0] > 0:
+                    print(f"🔄 Cycled through all images {universal_unfreeze_count[0]} time(s)")
 
-                # Determine target coverage: use min_coverage if set, otherwise default to 90%
-                target_coverage = args.min_coverage if args.min_coverage else 90.0
+        # PHASE 3: Create final collages and save
+        print(f"\n{'='*60}")
+        print(f"PHASE 3: Creating final collages")
+        print(f"{'='*60}")
 
-                if initial_coverage < target_coverage:  # Only try to fill if below target
-                    print(f"Filling blank areas with repeats (initial coverage: {initial_coverage:.1f}%, target: {target_coverage:.1f}%)...")
+        for idx, (packer_inst, output_path) in enumerate(zip(packers, output_files)):
+            print(f"\nCollage {idx+1}/{len(image_batches)}: Creating final image...")
 
-                    # Track which images are already used in this collage
-                    used_image_ids = {id(img) for img in batch}
-
-                    # Track aspect ratios if no_repeats_tolerance is enabled
-                    used_aspects = None
-                    if args.no_repeats > 0:
-                        used_aspects = {img.aspect_ratio for img in batch}
-
-                    # Sort all images by size (largest first for better coverage)
-                    candidates = sorted(images,
-                                       key=lambda img: img.original_width * img.original_height,
-                                       reverse=True)
-
-                    # CRITICAL: Rebuild free rectangles before gap-filling to find ALL gaps
-                    print(f"Scanning canvas to detect all gaps...")
-                    packer.rebuild_free_rectangles_from_canvas()
-
-                    # Use the new direct gap-filling method with UNIVERSAL freezer
-                    added_count = packer.fill_gaps_with_repeats(
-                        candidate_images=candidates,
-                        target_coverage=target_coverage,
-                        used_image_ids=used_image_ids,
-                        used_aspects=used_aspects,
-                        no_repeats_tolerance=args.no_repeats,
-                        freezer=universal_freezer,
-                        unfreeze_count=universal_unfreeze_count
-                    )
-
-                    # Update packed images from packer
-                    packed = packer.packed_images
-
-                    if added_count > 0:
-                        final_coverage = sum(p.width * p.height for p in packed) / (args.width * args.height) * 100
-                        print(f"Added {added_count} repeat images to fill gaps "
-                              f"({initial_coverage:.1f}% → {final_coverage:.1f}% coverage)")
-
-
-            if not packed or len(packed) < len(batch):
-                print(f"Warning: Could only pack {len(packed)} out of {len(batch)} images.")
-                print("Try increasing canvas size or enabling --respect-original-size")
+            packed = packer_inst.packed_images
 
             # Create collage
-            print("Creating collage...")
-            collage = packer.create_collage(background_color=bg_color)
+            collage = packer_inst.create_collage(background_color=bg_color)
 
             # Save or collect for PDF
             if args.pdf:
@@ -2421,100 +2527,8 @@ def main():
             total_image_area = sum(p.width * p.height for p in packed)
             canvas_area = args.width * args.height
             coverage = (total_image_area / canvas_area) * 100
-            print(f"Canvas coverage: {coverage:.1f}%")
-
-            # Print area uniformity statistics
-            if packed and not args.respect_original_size:
-                areas = [p.width * p.height for p in packed]
-                avg_area = sum(areas) / len(areas)
-                max_area_diff = max(abs(area - avg_area) / avg_area * 100 for area in areas)
-                min_area = min(areas)
-                max_area = max(areas)
-                print(f"Area uniformity - Average area: {avg_area:.0f}, Min: {min_area:.0f}, Max: {max_area:.0f}")
-                print(f"Area uniformity - Max deviation from average: {max_area_diff:.2f}%")
-
-                # Check aspect ratio preservation
-                max_aspect_error = 0.0
-                for p in packed:
-                    actual_aspect = p.width / p.height
-                    original_aspect = p.info.aspect_ratio
-                    aspect_error = abs(actual_aspect - original_aspect) / original_aspect * 100
-                    max_aspect_error = max(max_aspect_error, aspect_error)
-                print(f"Aspect ratio preservation - Max deviation: {max_aspect_error:.2f}%")
-
-                # Check overlap statistics
-                max_overlap_percent = 0.0
-                for i, p in enumerate(packed):
-                    p_area = p.width * p.height
-                    for j, other in enumerate(packed):
-                        if i == j:
-                            continue
-                        overlap_x = max(0, min(p.x + p.width, other.x + other.width) - max(p.x, other.x))
-                        overlap_y = max(0, min(p.y + p.height, other.y + other.height) - max(p.y, other.y))
-                        if overlap_x > 0 and overlap_y > 0:
-                            overlap_area = overlap_x * overlap_y
-                            overlap_percent = (overlap_area / p_area) * 100
-                            max_overlap_percent = max(max_overlap_percent, overlap_percent)
-                print(f"Image overlap - Max overlap: {max_overlap_percent:.2f}% of any image's area")
-
-            # Move to next batch
-            batch_idx += 1
-
-        # AGGRESSIVE: Check if any images were never used and force them in as repeats
-        print(f"\n{'='*60}")
-        print(f"Checking for unused images...")
-        print(f"{'='*60}")
-
-        all_used_images = set()
-        for batch in image_batches:
-            for img in batch:
-                all_used_images.add(id(img))
-
-        never_used = [img for img in images if id(img) not in all_used_images]
-
-        if never_used:
-            print(f"🚨 FOUND {len(never_used)} images that NEVER appeared!")
-            print(f"AGGRESSIVELY forcing them into collages as repeats...")
-
-            # Force them into the last collage(s) as repeats
-            for img in never_used:
-                # Add to the last collage
-                if image_batches:
-                    image_batches[-1].append(img)
-                    print(f"  Forced missing image into last collage: {img.path}")
-
-            # Re-create the last collage(s) with the forced images
-            print(f"\nRe-creating collages with forced images...")
-            # Go back and recreate affected batches
-            batch_idx = len(image_batches) - 1
-            while batch_idx >= 0 and batch_idx >= len(canvases):
-                batch = image_batches[batch_idx]
-                output_path = output_files[batch_idx]
-
-                print(f"\n{'='*60}")
-                print(f"RE-CREATING Collage {batch_idx+1}/{len(image_batches)}: {len(batch)} images -> {output_path}")
-                print(f"{'='*60}")
-
-                # Pack images
-                print("Packing images...")
-                packed = packer.pack(batch)
-
-                # Create collage
-                print("Creating collage...")
-                collage = packer.create_collage(background_color=bg_color)
-
-                # Update canvas
-                if args.pdf:
-                    if batch_idx < len(canvases):
-                        canvases[batch_idx] = collage
-                    else:
-                        canvases.append(collage)
-                else:
-                    collage.save(output_path, quality=95)
-                    print(f"Collage saved to {output_path}")
-
-                batch_idx -= 1
-                break  # Only recreate last one for now
+            print(f"  Final coverage: {coverage:.1f}%")
+            print(f"  Total images: {len(packed)}")
 
         # If PDF mode in sequential processing, save all canvases to a single PDF
         if args.pdf and canvases:
