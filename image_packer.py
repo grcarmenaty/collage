@@ -19,6 +19,7 @@ from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import random
+from itertools import combinations
 
 
 @dataclass
@@ -2029,6 +2030,15 @@ def main():
              'Will test different canvas counts around this target and pick the one with best coverage.'
     )
     parser.add_argument(
+        '--full',
+        type=int,
+        metavar='N',
+        help='Create collages with all possible combinations of N images. '
+             'Each combination becomes the base of a collage, then gaps are filled to min-coverage. '
+             'Example: with 4 images and --full 2, creates 6 collages (all pairs). '
+             'Must be used with --allow-repeats and --min-coverage.'
+    )
+    parser.add_argument(
         '-j', '--jobs',
         type=int,
         default=None,
@@ -2038,13 +2048,24 @@ def main():
     args = parser.parse_args()
 
     # Validate flags
-    if sum([bool(args.images_per_collage), bool(args.num_collages), bool(args.max_coverage)]) > 1:
-        print("Error: Can only specify one of -n/--images-per-collage, -p/--num-collages, or --max-coverage")
+    if sum([bool(args.images_per_collage), bool(args.num_collages), bool(args.max_coverage), bool(args.full)]) > 1:
+        print("Error: Can only specify one of -n/--images-per-collage, -p/--num-collages, --max-coverage, or --full")
         return 1
 
     if args.max_coverage and args.max_coverage < 1:
         print("Error: --max-coverage target images per canvas must be at least 1")
         return 1
+
+    if args.full:
+        if not args.allow_repeats:
+            print("Error: --full requires --allow-repeats flag")
+            return 1
+        if not args.min_coverage:
+            print("Error: --full requires --min-coverage to be set")
+            return 1
+        if args.full < 1:
+            print("Error: --full N must be at least 1")
+            return 1
 
     if args.split_tolerance < 0 or args.split_tolerance > 100:
         print("Error: --split-tolerance must be between 0 and 100")
@@ -2055,7 +2076,7 @@ def main():
         return 1
 
     if args.min_coverage:
-        if not args.allow_repeats:
+        if not args.allow_repeats and not args.full:
             print("Error: --min-coverage requires --allow-repeats flag")
             return 1
         if args.min_coverage < 0 or args.min_coverage > 100:
@@ -2185,22 +2206,48 @@ def main():
         print(f"Creating {len(image_batches)} collage(s) with optimized distribution for maximum coverage")
         if args.allow_repeats:
             print(f"Note: Repeats will be added after collage creation to fill blank areas (from full pool of {len(images)} images)")
+    elif args.full:
+        # Generate all combinations of N images
+        n = args.full
+        if n > len(images):
+            print(f"Error: --full {n} requested but only {len(images)} images available")
+            return 1
+
+        print(f"\n{'='*60}")
+        print(f"FULL COMBINATIONS MODE")
+        print(f"{'='*60}")
+        print(f"Generating all combinations of {n} images...")
+
+        # Generate all combinations
+        all_combinations = list(combinations(images, n))
+        num_combinations = len(all_combinations)
+
+        print(f"Generated {num_combinations} combinations")
+        print(f"Each combination will be the base of a collage, then filled to {args.min_coverage}% coverage")
+
+        # Convert combinations to lists (batches)
+        image_batches = [list(combo) for combo in all_combinations]
+
+        print(f"Creating {len(image_batches)} collage(s) from all combinations")
     else:
         # Single collage with all images
         image_batches = [images]
 
     # CRITICAL: Ensure EVERY image appears in at least one batch
-    print(f"\n{'='*60}")
-    print(f"ENSURING ALL IMAGES USED")
-    print(f"{'='*60}")
-    image_batches = ensure_all_images_used(image_batches, images)
+    # (Skip for --full mode since combinations are intentionally specific)
+    if not args.full:
+        print(f"\n{'='*60}")
+        print(f"ENSURING ALL IMAGES USED")
+        print(f"{'='*60}")
+        image_batches = ensure_all_images_used(image_batches, images)
 
     # CRITICAL: Final safety check - merge any single-image batches
-    # This catches cases that might have been missed by distribution functions
-    print(f"\nFinal batch check: {len(image_batches)} collage(s) with {[len(b) for b in image_batches]} images each")
-    if len(image_batches) > 1:
-        image_batches = merge_single_image_batches(image_batches)
-        print(f"After merge: {len(image_batches)} collage(s) with {[len(b) for b in image_batches]} images each")
+    # (Skip for --full mode since we want exact combinations, even if n=1)
+    if not args.full:
+        print(f"\nFinal batch check: {len(image_batches)} collage(s) with {[len(b) for b in image_batches]} images each")
+        if len(image_batches) > 1:
+            image_batches = merge_single_image_batches(image_batches)
+            print(f"After merge: {len(image_batches)} collage(s) with {[len(b) for b in image_batches]} images each")
 
     # Generate output filenames
     output_files = []
